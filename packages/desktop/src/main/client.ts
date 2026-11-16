@@ -98,6 +98,17 @@ export class OrbitClient extends EventEmitter {
     this.send({ t: 'desktop.session.stop' });
   }
 
+  /**
+   * Ask the server to rotate the pairing code and send a fresh one back.
+   *
+   * Answers through the normal `pairing` event, so every place that already
+   * listens for `server.pairing` (the status push to the renderer) updates without
+   * knowing this method exists.
+   */
+  requestPairing(): boolean {
+    return this.send({ t: 'desktop.pairing.request' });
+  }
+
   revoke(receiverId: string): void {
     this.settings.forgetReceiver(receiverId);
     this.send({ t: 'desktop.device.revoke', receiverId });
@@ -231,6 +242,12 @@ export class OrbitClient extends EventEmitter {
         return;
       case 'server.fist.tablet':
         this.emit('tabletFist', msg.fist, msg.at);
+        return;
+      case 'server.remote.pointer':
+        this.emit('remotePointer', msg.panelId, msg.x, msg.y, msg.kind);
+        return;
+      case 'server.remote.key':
+        this.emit('remoteKey', msg.panelId, msg.text, msg.key);
         return;
       case 'server.error':
         this.emit('error', msg.code, msg.message);

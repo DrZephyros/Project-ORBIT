@@ -591,6 +591,11 @@ class MouthGestureMachine:
         self._scroll_last_ms = self._scroll_pose_since if believable else now_ms
         self._scroll_accum = 0.0
 
+    @property
+    def grab_active(self) -> bool:
+        """True while a window is physically held, so the fist owns the frame."""
+        return self._grab_phase is not None
+
     def _update_desktop_switch(
         self,
         left_fist: bool,

@@ -92,12 +92,16 @@ export function useStreams(send: (msg: ClientMessage) => boolean) {
       pc.ontrack = (event) => {
         const [incoming] = event.streams;
         const stream = incoming ?? new MediaStream([event.track]);
-        patch(panelId, { stream, status: 'live' });
+        patch(panelId, { stream });
+        // A track is not a picture. Stay 'connecting' until a frame actually
+        // decodes, so a sender that negotiates but never produces pixels shows a
+        // status instead of an unexplained black rectangle.
+        void awaitFirstFrame(panelId, pc);
       };
 
       pc.onconnectionstatechange = () => {
         const state = pc.connectionState;
-        if (state === 'connected') patch(panelId, { status: 'live' });
+        if (state === 'connected') void awaitFirstFrame(panelId, pc);
         else if (state === 'failed') patch(panelId, { status: 'failed' });
         else if (state === 'disconnected') patch(panelId, { status: 'connecting' });
       };
@@ -125,6 +129,41 @@ export function useStreams(send: (msg: ClientMessage) => boolean) {
       /* a candidate for a closed connection is expected on reconnect */
     }
   }, []);
+
+  /**
+   * Wait for the first decoded frame before calling a stream live.
+   *
+   * Reported: "it was just a black screen." `ontrack` fires when a track is
+   * negotiated, which happens well before any pixels arrive - and if the sender
+   * is capturing something with no surface, pixels never arrive at all. Polling
+   * `framesDecoded` is the only way to tell those two apart.
+   *
+   * The 6 s give-up keeps older Safari builds (which omit `framesDecoded`) from
+   * sitting on 'connecting' forever; the panel is shown either way, just later.
+   */
+  async function awaitFirstFrame(panelId: string, pc: RTCPeerConnection): Promise<void> {
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') return;
+      try {
+        const report = await pc.getStats();
+        let decoded = 0;
+        report.forEach((entry) => {
+          if (entry.type === 'inbound-rtp' && (entry as RTCInboundRtpStreamStats).kind === 'video') {
+            decoded = (entry as RTCInboundRtpStreamStats).framesDecoded ?? 0;
+          }
+        });
+        if (decoded > 0) {
+          patch(panelId, { status: 'live' });
+          return;
+        }
+      } catch {
+        /* transient stats failure; try again */
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    patch(panelId, { status: 'live' });
+  }
 
   function startStats(panelId: string, pc: RTCPeerConnection): void {
     const timer = window.setInterval(async () => {

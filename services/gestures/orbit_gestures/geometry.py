@@ -400,10 +400,15 @@ def detect_fist(
     mouth_max_distance: float = 0.75,
     front_min_distance: float = 1.15,
     max_front_distance: float = 3.5,
+    # Far edge of the "still in front" band once a grab is already held. A drag
+    # pushes the hand well away from the face; this only has to be beyond any
+    # real reach.
+    held_max_front_distance: float = 8.0,
     min_face_width: float = 0.04,
     pinching: bool = False,
     scrolling: bool = False,
     world_hand: Sequence[object] | None = None,
+    held: bool = False,
 ) -> FistReading:
     """Classify a closed hand as "cupped at the mouth" or "fist held in front".
 
@@ -462,7 +467,19 @@ def detect_fist(
     # the other.
     curled = fist_pose(hand, curl_threshold, world_hand=world_hand)
     at_mouth = curled and distance <= mouth_max_distance
-    in_front = curled and front_min_distance <= distance <= max_front_distance
+
+    # A grab that is already held stays held.
+    #
+    # Reported: "moving windows with the right fist works but it is not
+    # continuous." Dragging a window sweeps the hand across the body, and the
+    # distance from the mouth grows with it: past `max_front_distance` the fist
+    # stopped reading as "in front", the grab released after its grace window,
+    # the window stopped following, and the user had to raise the fist again.
+    # Once the grab exists, the far edge of the pickup band is not information
+    # any more - the only thing worth releasing on is the hand opening or moving
+    # back to the mouth - so the band is lifted for as long as it is held.
+    far = max(max_front_distance, held_max_front_distance) if held else max_front_distance
+    in_front = curled and front_min_distance <= distance <= far
 
     if not curled:
         reason = "hand open"
@@ -476,6 +493,31 @@ def detect_fist(
         reason = "fist too far"
 
     return FistReading(curled, curl, at_mouth, in_front, distance, True, True, reason)
+
+
+def left_fist_closed(
+    hand: Sequence[object] | None,
+    curl_threshold: float = FIST_CURL_THRESHOLD,
+    world_hand: Sequence[object] | None = None,
+) -> bool:
+    """Whether the *left* hand is closed, for the horizontal screen swipe.
+
+    The left hand does no pointing, no pinching and no grabbing, so the band
+    arithmetic that separates a grab from dictation is not just unnecessary here
+    but actively harmful: it requires the fist to sit between 1.15 and 3.5 face
+    widths from the mouth, and a hand held out to the side - which is where a
+    swipe starts - falls outside that band and was never recognised. Reported as
+    "changing between desktops when I am looking at the laptop does not work",
+    with no `Desktop switch` line in the log at all: the gesture never fired.
+
+    All this has to answer is "closed left hand": the swipe is measured from the
+    hand's own travel, so where it is held cannot matter.
+    """
+    if hand is None:
+        return False
+    if fist_centre(hand) is None:
+        return False
+    return fist_pose(hand, curl_threshold, world_hand=world_hand)
 
 
 def landmark_payload(points: Sequence[object] | None) -> list[list[float]]:

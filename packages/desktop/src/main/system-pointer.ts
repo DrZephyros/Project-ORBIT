@@ -276,6 +276,126 @@ public static class OrbitMouse {
   /** The window a grab is currently moving, or zero. */
   public static IntPtr Target = IntPtr.Zero;
 
+  /**
+   * Where a window is right now, in this helper's DPI-virtualised pixels.
+   *
+   * Used to turn a position on the iPad into a position on the real window. The
+   * window can be moved by the laptop user at any moment, so this is read fresh
+   * for every event rather than cached from the grab.
+   */
+  public static bool Bounds(IntPtr hWnd, out int left, out int top, out int right, out int bottom) {
+    left = top = right = bottom = 0;
+    if (hWnd == IntPtr.Zero || !IsWindow(hWnd)) return false;
+    RECT r;
+    if (!GetWindowRect(hWnd, out r)) return false;
+    left = r.Left;
+    top = r.Top;
+    right = r.Right;
+    bottom = r.Bottom;
+    return true;
+  }
+
+  /**
+   * Absolute cursor position, so the remote pointer can be placed exactly.
+   *
+   * SetCursorPos is what the hand-drawn cursor already uses; a remote pointer
+   * from the iPad has to drive the same cursor, because the whole point is that
+   * the window is being operated for real rather than by a drawing.
+   */
+  public static bool Place(int x, int y) {
+    return SetCursorPos(x, y);
+  }
+
+  // -- keyboard ------------------------------------------------------------
+  //
+  // Typing is done with unicode SendInput rather than by pasting: the iPad's
+  // keyboard should behave like a keyboard, including in apps that refuse
+  // clipboard access, and the user's own clipboard must not be overwritten by
+  // typing a letter.
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct KEYBDINPUT {
+    public ushort wVk;
+    public ushort wScan;
+    public uint dwFlags;
+    public uint time;
+    public IntPtr dwExtraInfo;
+  }
+
+  // The native INPUT is a DWORD followed by a union that is as large as the
+  // biggest member (MOUSEINPUT, 32 bytes on x64): 40 bytes in total, with the
+  // union starting at offset 8. Declaring it sequentially with a manual padding
+  // field gets the size wrong, and SendInput rejects a wrong cbSize.
+  [StructLayout(LayoutKind.Explicit, Size = 40)]
+  public struct INPUT {
+    [FieldOffset(0)]
+    public uint type;
+    [FieldOffset(8)]
+    public KEYBDINPUT ki;
+  }
+
+  [DllImport("user32.dll")]
+  public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+  public const uint INPUT_KEYBOARD = 1;
+  public const uint KEYEVENTF_UNICODE = 0x0004;
+  public const uint KEYEVENTF_KEYUP_UNICODE = 0x0004 | 0x0002;
+
+  /**
+   * A whole string, in one SendInput call.
+   *
+   * One call rather than one per character: the helper reads commands from stdin
+   * on the same thread that would be sleeping between characters, so typing a
+   * sentence a letter at a time delayed every pointer move behind it.
+   */
+  public static uint TypeString(string text) {
+    if (text == null || text.Length == 0) return 0;
+    INPUT[] inputs = new INPUT[text.Length * 2];
+    for (int i = 0; i < text.Length; i++) {
+      char ch = text[i];
+      inputs[i * 2].type = INPUT_KEYBOARD;
+      inputs[i * 2].ki.wScan = (ushort)ch;
+      inputs[i * 2].ki.dwFlags = KEYEVENTF_UNICODE;
+      inputs[i * 2 + 1].type = INPUT_KEYBOARD;
+      inputs[i * 2 + 1].ki.wScan = (ushort)ch;
+      inputs[i * 2 + 1].ki.dwFlags = KEYEVENTF_KEYUP_UNICODE;
+    }
+    return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+  }
+
+  /**
+   * Bring a window to the front without resizing or restoring it.
+   *
+   * Typing from the iPad has to land in the window on the iPad. If the laptop's
+   * own focus went elsewhere (the user clicked something on the laptop while the
+   * iPad keyboard was open) then keystrokes would go to that other window, which
+   * is worse than not typing at all. SetForegroundWindow is refused when another
+   * process called it last, so the shell may decline; the click that normally
+   * precedes typing has already focused the window in that case.
+   */
+  public static bool FocusWindow(IntPtr hWnd) {
+    if (hWnd == IntPtr.Zero || !IsWindow(hWnd)) return false;
+    return SetForegroundWindow(hWnd);
+  }
+
+  /** A named key: virtual key code, down and up. */
+  public static void PressKey(byte vk) {
+    keybd_event(vk, 0, 0, UIntPtr.Zero);
+    keybd_event(vk, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+  }
+
+  public const byte VK_RETURN = 0x0D;
+  public const byte VK_BACK = 0x08;
+  public const byte VK_TAB = 0x09;
+  public const byte VK_ESCAPE = 0x1B;
+  public const byte VK_UP = 0x26;
+  public const byte VK_DOWN = 0x28;
+  public const byte VK_DELETE = 0x2E;
+  public const byte VK_SHIFT = 0x10;
+
   // Deliberately NOT made DPI-aware.
   //
   // A DPI-unaware process accepts and reports cursor coordinates in the
@@ -454,6 +574,17 @@ public static class OrbitMouse {
   }
 }
 "@
+# A wrong INPUT size means SendInput rejects every keystroke, silently. Checked
+# once at startup so a mistake in the struct shows up as a log line rather than
+# as "typing from the iPad does nothing".
+try {
+  $inputSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][OrbitMouse+INPUT])
+  if ($inputSize -ne 40) {
+    [Console]::Error.WriteLine('ORBIT pointer helper: INPUT is ' + $inputSize + ' bytes, expected 40; typing will not work')
+  }
+} catch {
+  [Console]::Error.WriteLine('ORBIT pointer helper: could not measure INPUT: ' + $_)
+}
 [Console]::Out.WriteLine('READY')
 [Console]::Out.Flush()
 while ($true) {
@@ -498,6 +629,62 @@ while ($true) {
       [void][OrbitMouse]::PinToCurrentDesktop($hwnd)
     } catch {
       [Console]::Error.WriteLine('ORBIT pointer helper: pin failed: ' + $_)
+    }
+    continue
+  }
+  if ($line.StartsWith('B ')) {
+    try {
+      $hwnd = [IntPtr][int64]$line.Substring(2).Trim()
+      $l = 0; $t = 0; $r = 0; $b = 0
+      if ([OrbitMouse]::Bounds($hwnd, [ref]$l, [ref]$t, [ref]$r, [ref]$b)) {
+        [Console]::Out.WriteLine('BOUNDS ' + $hwnd + ' ' + $l + ' ' + $t + ' ' + $r + ' ' + $b)
+      } else {
+        [Console]::Out.WriteLine('BOUNDS ' + $hwnd + ' NONE')
+      }
+      [Console]::Out.Flush()
+    } catch {
+      [Console]::Error.WriteLine('ORBIT pointer helper: bounds failed: ' + $_)
+      [Console]::Out.WriteLine('BOUNDS 0 NONE')
+      [Console]::Out.Flush()
+    }
+    continue
+  }
+  if ($line.StartsWith('X ')) {
+    # Base64 so spaces, quotes and newlines survive the line protocol.
+    try {
+      $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line.Substring(2).Trim()))
+      $sent = [OrbitMouse]::TypeString($text)
+      # SendInput returns how many events it accepted. Fewer than asked for means
+      # another process has the input queue blocked, which is worth saying out
+      # loud rather than losing keystrokes in silence.
+      if ($sent -ne ($text.Length * 2)) {
+        [Console]::Error.WriteLine('ORBIT pointer helper: only ' + $sent + ' of ' + ($text.Length * 2) + ' key events were accepted')
+      }
+    } catch {
+      [Console]::Error.WriteLine('ORBIT pointer helper: typing failed: ' + $_)
+    }
+    continue
+  }
+  if ($line.StartsWith('Y ')) {
+    try {
+      $name = $line.Substring(2).Trim()
+      $map = @{
+        'Enter' = 0x0D; 'Backspace' = 0x08; 'Tab' = 0x09; 'Escape' = 0x1B;
+        'ArrowLeft' = 0x25; 'ArrowRight' = 0x27; 'ArrowUp' = 0x26; 'ArrowDown' = 0x28;
+        'Delete' = 0x2E;
+      }
+      if ($map.ContainsKey($name)) { [OrbitMouse]::PressKey([byte]$map[$name]) }
+    } catch {
+      [Console]::Error.WriteLine('ORBIT pointer helper: key failed: ' + $_)
+    }
+    continue
+  }
+  if ($line.StartsWith('F ')) {
+    try {
+      $hwnd = [IntPtr][int64]$line.Substring(2).Trim()
+      [void][OrbitMouse]::FocusWindow($hwnd)
+    } catch {
+      [Console]::Error.WriteLine('ORBIT pointer helper: focus failed: ' + $_)
     }
     continue
   }
@@ -583,6 +770,13 @@ const CLICK_SETTLE_PX = DRAG_THRESHOLD_PX * 4;
 const MAX_STDIN_BACKLOG = 32 * 1024;
 
 /** A real Windows window the helper is currently moving. */
+export interface WindowRect {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
 export interface WindowTarget {
   /** Decimal HWND, kept as a string so it never loses precision in a double. */
   hwnd: string;
@@ -611,6 +805,8 @@ export class SystemPointer {
   private backlogLoggedAt = 0;
   /** The outstanding `G` window-grab request, if any. */
   private grabResolve: ((target: WindowTarget | null) => void) | null = null;
+  /** Answers to `B` commands, in the order the helper was asked. */
+  private boundsQueue: ((rect: WindowRect | null) => void)[] = [];
   private textFieldResolve: ((focused: boolean) => void) | null = null;
 
   constructor(private readonly scriptPath: string) {}
@@ -812,6 +1008,61 @@ export class SystemPointer {
     this.send('E');
   }
 
+  /**
+   * Where a window is now, in the helper's coordinate space.
+   *
+   * Resolves `null` on any failure, so a caller never moves the pointer to a
+   * guess: a wrong position would click whatever is under it.
+   */
+  bounds(hwnd: string): Promise<WindowRect | null> {
+    if (!this.supported) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (rect: WindowRect | null): void => {
+        if (settled) return;
+        settled = true;
+        resolve(rect);
+      };
+      this.boundsQueue.push(finish);
+      this.send(`B ${hwnd}`);
+      const timer = setTimeout(() => {
+        // Drop this resolver from the queue: the helper is serial, so a late
+        // answer belongs to a request that has already given up, and keeping it
+        // would pair every later answer with the wrong caller.
+        this.boundsQueue = this.boundsQueue.filter((entry) => entry !== finish);
+        finish(null);
+      }, 700);
+      timer.unref?.();
+    });
+  }
+
+  /** Type literal text into whatever has keyboard focus. */
+  typeText(text: string): void {
+    if (!this.supported || !text) return;
+    // Base64 keeps the line protocol intact: text may contain spaces, quotes or
+    // newlines, and the helper reads one line at a time.
+    const payload = Buffer.from(text, 'utf8').toString('base64');
+    this.send(`X ${payload}`);
+  }
+
+  /** Press a named key that a soft keyboard sends instead of text. */
+  pressKey(name: string): void {
+    if (!this.supported || !name) return;
+    this.send(`Y ${name}`);
+  }
+
+  /** Bring a window to the front, so typing lands in it. */
+  focus(hwnd: string): void {
+    if (!this.supported || !hwnd) return;
+    this.send(`F ${hwnd}`);
+  }
+
+  /** Put the pointer exactly where a remote pointer asked, and click there. */
+  place(x: number, y: number): void {
+    if (!this.supported) return;
+    this.send(`M ${Math.round(x)} ${Math.round(y)}`);
+  }
+
   /** Stop the helper. Safe to call more than once. */
   dispose(): void {
     this.disposed = true;
@@ -825,6 +1076,9 @@ export class SystemPointer {
     const grab = this.grabResolve;
     this.grabResolve = null;
     grab?.(null);
+    const bounds = this.boundsQueue;
+    this.boundsQueue = [];
+    for (const resolve of bounds) resolve(null);
     if (!child) return;
     log.info('pointer', 'Stopping the pointer helper.', { pid: child.pid });
     try {
@@ -856,6 +1110,23 @@ export class SystemPointer {
       const resolve = this.textFieldResolve;
       this.textFieldResolve = null;
       resolve?.(line.slice('TEXTFIELD '.length).trim() === 'True');
+      return;
+    }
+    if (line.startsWith('BOUNDS ')) {
+      const resolve = this.boundsQueue.shift();
+      const parts = line.slice('BOUNDS '.length).trim().split(/\s+/);
+      if (!resolve) return;
+      if (parts.length < 5 || parts[1] === 'NONE') {
+        resolve(null);
+        return;
+      }
+      const nums = parts.slice(1, 5).map(Number);
+      if (nums.some((n) => !Number.isFinite(n))) {
+        resolve(null);
+        return;
+      }
+      const [left, top, right, bottom] = nums as [number, number, number, number];
+      resolve({ left, top, right, bottom });
       return;
     }
     if (line === 'NOWINDOW') {

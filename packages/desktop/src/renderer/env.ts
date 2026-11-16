@@ -53,6 +53,8 @@ interface EventMap {
   'orbit:ev-error': (code: string, message: string) => void;
   'orbit:ev-gesture-status': (status: GestureStatus) => void;
   'orbit:ev-gesture-event': (event: GestureEventMessage) => void;
+  'orbit:ev-grab-target': (target: { hwnd: string; sourceId: string | null; title: string }) => void;
+  'orbit:ev-cycle-panel': (direction: 'left' | 'right') => void;
   'orbit:ev-gesture-state': (state: { state: GestureServiceState; error: string | null }) => void;
 }
 

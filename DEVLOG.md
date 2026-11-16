@@ -8,6 +8,450 @@ Newest entries first.
 
 ---
 
+## 2026-11-16 (fortieth pass) — the window on the iPad is a window, not a picture of one
+
+**Scope:** `packages/shared`, `packages/server`, `packages/desktop`,
+`packages/receiver`
+
+Reported: "on the iPad, the cursor should be controlled by right hand only...
+left should only be for window switching", and "when I transfer a window, all
+controls to that window must be available on the iPad - the onscreen keyboard
+must type into it, and my hand must control a working cursor, not a dummy one".
+
+### The cursor was real; it just had nothing to operate
+
+The iPad already drew a cursor and turned a pinch into DOM events at that point
+on the page. On ORBIT's own UI that is correct - it presses ORBIT's buttons. On a
+transferred window it was theatre: the window is running on the laptop, and no
+DOM event on a `<video>` reaches it. So the pinch clicked a picture.
+
+Remote input is now a typed message, exactly like the eye tracking: a position as
+a *fraction of the panel*, a `move`/`down`/`up`, and a keystroke. The desktop
+maps the fraction onto the real window's bounds - read fresh from the helper for
+every event, because the window can be moved by the laptop user at any moment -
+and drives the Windows cursor there with the same `SetCursorPos`/`mouse_event`
+the hand already used. `receiver.remote.pointer`, `receiver.remote.key` in;
+`server.remote.pointer`, `server.remote.key` out to the desktop.
+
+The drawn cursor stays. It is not a substitute any more, it is the low-latency
+copy: a captured window does not contain the Windows pointer, and the video is a
+round trip behind the hand, so without the dot the user would aim blind for about
+a tenth of a second.
+
+### The window it controls is named, not guessed
+
+The renderer reports `panelId -> hwnd` when it hands a window over, using the
+handle the fist actually grabbed (`orbit:ev-grab-target`). Without that mapping
+the only options were "the frontmost window", which is wrong the moment the user
+touches the laptop, or "whatever the cursor was over", which is wrong the moment
+the iPad moves it.
+
+The hand-off event also carries that handle now, so the renderer sends the window
+that left the laptop rather than "the held panel, or the selected one" - a stale
+selection could previously send a different window than the one in the hand.
+
+### Typing
+
+A soft keyboard has no field to type into when the thing on screen is a laptop
+window, so the iPad's keyboard is pointed at it: a hidden-but-focusable textarea
+(iOS will not raise the keyboard for a `display: none` field) behind a small
+"Keyboard" button, one message per keystroke. Named keys go as keys; everything
+else goes as text. The helper types with unicode `SendInput` in a single call per
+message - not per character, because the helper reads commands on the same thread
+that would be sleeping between characters and every pointer move queued behind
+it.
+
+Two details worth keeping:
+
+- The native `INPUT` struct is 40 bytes on x64 with the union at offset 8. It is
+  declared `Explicit` with `Size = 40`, and the helper measures it at startup and
+  complains on stderr if it is wrong, because a wrong `cbSize` makes `SendInput`
+  reject every keystroke in silence.
+- Before typing, the window is brought to the foreground. A keystroke has no
+  position, so unlike a click there is nothing telling the shell which window it
+  was meant for, and typing into the wrong application is worse than not typing.
+
+### One hand each
+
+The receiver asked MediaPipe for one hand and used it for everything, so a paging
+sweep also dragged the cursor and a pinch could be read as the start of a page
+turn. It asks for two now, and uses the handedness label: the right hand is the
+pointer, the left hand only pages. The label drops for a frame or two when a hand
+is half out of shot, so the chosen index is sticky rather than re-decided every
+frame. If no label is reported at all (an older build), the first unclaimed hand
+is the pointer, as before.
+
+### Routing the rest by gaze
+
+- A left-fist swipe already chose desktops or cast windows by gaze; when the iPad
+  is not reporting at all it now falls back to the service's live router instead
+  of assuming the laptop.
+- Scrolling used to be dropped entirely while looking at the iPad. It is not
+  dropped any more if the iPad is actually steering a window on the laptop: the
+  wheel goes to whatever is under the cursor, and the cursor is on that window.
+
+### A window can no longer leave without a gesture
+
+Completing a transfer needed a fist to open while the head was on the iPad. But
+an iPad that has just started tracking reports an *open* hand on its first frame,
+which is a camera warming up, not a release - so looking over at the iPad while
+carrying could send the window on its own. The tablet's fist must now be seen
+closed at least once during the carry before an open hand counts.
+
+### Verified
+
+- `services/gestures/tests/test_gesture.py` - 281 passed, 0 failed.
+- `packages/server/test/pairing.test.mjs` - 18 passed, 0 failed, including two
+  new cases: the remote pointer/key envelopes cross the relay intact, and a
+  position outside the panel is clamped rather than dropped.
+- `tools/helper-probe.mjs` (new) extracts the PowerShell/C# helper from the built
+  output and drives it over stdin: `READY`, `G 0` returns a window with bounds,
+  `B` answers `BOUNDS <hwnd> 0 0 1536 864`, `F` and `Y` do not throw. The INPUT
+  size check reports nothing, so the struct is 40 bytes.
+- `npm run typecheck`, `npm run build` clean.
+
+**Not verified:** the whole loop on real hardware - an iPad pinch moving the
+laptop cursor on a transferred window, and the on-screen keyboard typing into it.
+The messages, the mapping, the cursor placement and the typing are each exercised
+separately; nobody has yet put a hand in front of an iPad and watched a remote
+window respond.
+
+---
+
+## 2026-11-16 (thirty-ninth pass) — a swipe that means two things, a drag that keeps going
+
+Five requests in one go: more pointer sensitivity on the iPad, windows that fill
+it, a left-fist swipe to page between cast windows, desktop switching on the
+laptop, and a window drag that does not stop half way.
+
+**1. iPad pointer sensitivity.** The laptop moves its cursor at
+`POINTER_POSITION_GAIN_X/Y = 3.5/3.8` screen fractions per face width; the iPad's
+own tracker was at `GAIN_X/Y = 1.4/1.5`, so it needed better than twice the hand
+travel for the same distance. Matched to the laptop's pair (3.1/3.4 - slightly
+lower on X because the iPad is held closer, so the same sweep covers more of its
+frame). `SMOOTHING` dropped 0.6 -> 0.45 and `DEAD_ZONE` 0.014 -> 0.009 in step:
+amplification multiplies a dead zone into a sticky patch in the middle of the
+screen, and smooths a fast movement into lag. `MAX_JUMP` raised to 0.95, because
+at 3.1x an ordinary deliberate sweep looks like a tracker glitch to a governor
+tuned for 1.4x.
+
+**2. Windows fill the iPad.** The workspace bar and footer were spending ~95 px
+of a 768 px tall screen on chrome, so a "full screen" window was not one. In the
+solo layout both are hidden, the canvas is black, and the two things that have to
+stay reachable - which window this is, and how to send it back - float in a faded
+strip over the top edge that brightens on touch. Measured: panel 1024x768 in a
+1024x768 viewport, fill ratio 1.0 on both axes, no card border or radius.
+
+**3. Two functions, one gesture.** A four-finger trackpad swipe means "slide to
+the next screen in that direction". Which screens those are depends on where the
+head is pointing, and now both are wired to the same left-fist motion:
+
+- Looking at the laptop -> `systemPointer.switchDesktop()`, as before.
+- Looking at the iPad  -> `EV.cyclePanel`, and the desktop renderer selects the
+  next window that has an owner device. It wraps, so the gesture never
+  dead-ends.
+
+The witness is the iPad's own gaze (`tabletGazeFresh()`), never
+`lastPointer.gaze`: once the head turns to the tablet the laptop's webcam loses
+the face, so only the tablet can still say where the user is looking.
+
+Two more paths page windows, because a gesture that only works when one camera
+happens to see the hand is a gesture that does not work:
+
+- The iPad's own tracker: a closed hand swept sideways (`onSwipe`, 0.12 of the
+  frame, 400 ms cooldown, vertical drift rejected) pages the windows it holds.
+- A finger swipe on the glass: 60 px, mostly horizontal.
+
+**4. The desktop swipe never fired at all.** Asked to fix "changing between
+desktops when I am looking at the laptop does not work"; there was no
+`Desktop switch` line in the log, so the gesture was never reaching the app. The
+left hand was being classified by the *right* hand's grab detector, which only
+calls a hand "in front" between 1.15 and 3.5 face widths from the mouth - and a
+hand held out to the side, which is where a swipe begins, is outside that band.
+`left_fist_closed()` asks the only question the left hand needs to answer: is it
+closed. The band arithmetic is not information for a hand that never points,
+pinches or grabs.
+
+**5. A drag that stops half way.** Reported as "moving windows with the right
+fist works but it is not continuous". Two causes, both fixed:
+
+- The fist had to stay inside the *pickup* band to keep the grab. Dragging sweeps
+  the hand across the body, so the distance from the mouth grows; past 3.5 face
+  widths the fist stopped reading as "in front", the grab was released after its
+  grace window, and the window stopped following - once per half screen.
+  `detect_fist(held=True)` lifts the far edge while a grab exists: the only
+  release worth making is the hand opening or returning to the mouth.
+- Any single pointer frame decided as 'tablet' ended the physical drag. One frame
+  of head movement, or the iPad's tracker saying "looking" while the user glanced
+  at it, stopped the window dead. The gaze now has to stay on the tablet for
+  `GAZE_SETTLE_MS` = 320 ms before it can take the window away: deliberate
+  hand-offs still work, glances no longer do.
+
+**Tested:** `281 passed` gesture tests (three new: a held grab survives a wide
+sweep, a left hand out wide is recognised as a swipe, and a left fist held out
+wide walks desktops), `16 passed` pairing tests, `npm run typecheck` and
+`npm run build` clean, receiver layout screenshot measured and looked at.
+
+**Not verified:** all of it on real hardware - a hand sweeping for real, a real
+iPad decode, and the sensitivity numbers, which are a judgement call from the
+laptop's tuned pair rather than from this session's hand.
+
+---
+
+## 2026-11-16 (thirty-eighth pass) — the window that was never the window, and a cast that fills the screen
+
+Reported: "when I put a window on my iPad it wasn't the window. It was just a
+small black rectangle with the title 'Status', and nothing I cast ever showed
+up."
+
+Two separate faults, and the second one was making the first look like a
+rendering bug.
+
+**1. The window that was grabbed was not the window that was captured.**
+
+`window.grab` came out of the gesture service with no idea *which* window it
+meant, so the renderer picked one itself: `sources[0]`, on the theory that
+`desktopCapturer` lists windows in z-order, frontmost first. That theory is
+right, and it is exactly the problem - a hidden helper window belonging to
+another app (`Wispr Flow`, titled "Status") sits at the front of that list with
+a real, non-zero thumbnail and **no pixels at all**. It therefore passed the
+existing filter, won the race, captured as pure black, and was handed to the
+iPad under its own name. Hence a small black window called "Status".
+
+Probed it directly rather than guessing: a standalone Electron script printed
+every source with a mean thumbnail brightness.
+
+    "Status"           id=window:66504:0     thumb 158x200   b=0
+    "Google Gemini …"  id=window:1575834:0   thumb 320x171   b=29
+
+`Get-Process` confirmed the process and the title. So:
+
+- `requestSources` now rejects a source whose thumbnail is uniformly black
+  (`thumbnailBrightness() <= 2`). A window with no surface is not offered as
+  something to grab or cast.
+- More importantly, the *decision* moved to the only place that knows the
+  answer. The PowerShell helper already returns the HWND it grabbed, and a
+  capture source id is `window:<decimal HWND>:<n>` - verified by comparing
+  `GetForegroundWindow()` (1575834) with the source id above. `resolveGrabSource()`
+  matches on that handle and emits `orbit:ev-grab-target`, so the renderer is
+  told which window to capture instead of guessing. The black-thumbnail filter
+  is deliberately not applied to an exact handle match: a window that is
+  momentarily black is still the window the user grabbed.
+
+The panel is now created from that reply, not from `window.grab`, so the source
+is resolved before anything is streamed. Grabbing with the system pointer off
+also resolves now - it skips only the physical drag (`windowDrag.pinned`), not
+the capture.
+
+**2. It really was small, too.**
+
+A single panel was still drawn at workspace-canvas scale: a 1024x768 logical
+space, with new panels at 55% x 50% of it. With one window on an iPad there is
+nothing to arrange, so the receiver now draws a lone panel **full-bleed** at
+viewport size (`Workspace`'s `solo` branch, `.canvas-solo`), with the card
+border, radius and shadow removed. A second panel brings the arrange canvas
+back.
+
+**Verified, not assumed:**
+
+- `tools/cast-preview.mjs` runs the real pipeline end to end - enumerate, capture
+  with the same constraints `useSenders` uses, negotiate sender and receiver peer
+  connections in one process, decode, then measure the decoded frame's mean
+  brightness. Result: `video 1920x1020`, both connections `connected`,
+  `brightness 30` (matching the source thumbnail), `framesDecoded 2` - real
+  pixels over real WebRTC. Casting works when the source is right.
+- `tools/hwnd-probe.mjs` plus `GetForegroundWindow()` confirmed the
+  HWND -> source-id mapping the fix depends on.
+- `npm run typecheck` and `npm run build` clean; `272 passed` gesture tests;
+  `16 passed` pairing tests.
+
+**Also changed:** the receiver no longer calls a stream live merely because a
+track was negotiated. `awaitFirstFrame()` waits for `framesDecoded > 0` (with a
+6 s give-up for older Safari), so a sender that never produces pixels shows the
+status overlay instead of an unexplained black rectangle.
+
+**Not verified:** a real iPad receiving the window. The pieces on both ends are
+tested and the wire path is unchanged, but the last metre needs the hardware.
+
+---
+
+## 2026-11-16 (thirty-seventh pass) — a pairing code you can actually renew
+
+Reported: "when a code expires there is no way to get a new one."
+
+Correct, and it was structural. A pairing code is six digits, single use and
+good for `PAIRING_TTL_MS` = **5 minutes**. The server only ever *pushed* a code -
+on `desktop.hello`, on `desktop.session.start`, and when a receiver was rejected -
+and there was no client message that asked for one. So the Setup page's countdown
+ran down to `0:00` and stopped there: dead code, dead QR, no button, and the only
+way to pair afterwards was to restart ORBIT so `desktop.hello` ran again.
+
+Three pieces, smallest first:
+
+1. `desktop.pairing.request` (client -> server) rotates the code and answers with
+   `server.pairing`, which every existing listener already handles.
+2. `IPC.newPairingCode` gives the renderer a way to ask: client -> `requestPairing()`
+   -> hub -> `server.pairing` -> the normal status push.
+3. The Setup page now has a **New code** button next to Copy/Open, and re-fetches
+   on its own the moment the countdown reaches zero. The meta line says
+   "This code has expired. A new one is being issued — or press "New code"."
+   instead of silently counting to zero, and a failed request says so.
+
+Two things the first attempt got wrong, both caught by the new test:
+
+- **The hub has an explicit `KNOWN_TYPES` allowlist** in front of `route()`. My
+  first handler was unreachable: the server answered "Unknown message type." and
+  the test timed out. Adding the type to the set is the actual gate.
+- **A one-second "debounce" that returned the *existing* code.** It looked
+  defensive and made the button appear broken: press "New code" within a second
+  of a rotation and you get the same code back. Since the page only asks once per
+  expiry, there is no loop to protect against, so a request now always rotates.
+
+Verified with a new case in `packages/server/test/pairing.test.mjs` (real server,
+real sockets):
+
+```
+ok   the desktop can ask for a replacement code when one expires
+```
+
+which asserts the replacement is six digits, differs from the dead one, has a
+live `expiresAt`, carries the new code in its QR payload - and that the *old* code
+is genuinely rejected, so a stale QR fails loudly instead of pairing the wrong
+session. `16 passed, 0 failed`; `npm run typecheck` and `npm run build` clean. Not
+verified in the running app: it needs a restart, and a five minute wait for a real
+countdown to hit zero.
+
+---
+
+## 2026-11-16 (thirty-sixth pass) — a ring around the window you are holding
+
+A grab was invisible. The window moved, so *something* was happening, but the app
+never showed that a carry was live, which window it had, or that opening the hand
+was the confirmation. Request: "an indicator on the laptop when it detects that I
+grabbed a window. Something cool that is visible when I am on the grabbed
+window."
+
+So the indicator is not in ORBIT's panel. While a window is being carried the eyes
+are on that window, and ORBIT is usually behind it, so a banner in the app would be
+seen only by someone who did not need it. Instead there is a second window:
+transparent, frameless, click-through, always-on-top, sized to the grabbed window
+plus 22 px of padding so the glow has somewhere to spill. Everything is drawn in
+that padding or as a rim - the overlay sits on another application's pixels, and
+filling the middle would hide the thing being carried.
+
+`packages/desktop/src/main/carry-indicator.ts`, driven from `ipc.ts`:
+
+| moment | what is on screen |
+| --- | --- |
+| `window.grab`, helper replies with the window rect | cyan → violet ring, pulsing corner brackets, badge **WINDOW GRABBED** / "drag to move · look at the iPad, then open your hand" |
+| the head turns to the iPad (`tabletGaze` looking, carry still held) | ring and badge turn violet, **READY TO SEND** / "open your hand to hand it to the iPad", glow breathes faster |
+| the carry completes (`handOffToTablet`) | flash of mint green, **SENT TO IPAD**, one expanding burst, gone in 0.95 s |
+| released with nowhere to go, reset, disarm, 30 s timeout | grey **LET GO**, fades in 0.38 s |
+
+Geometry is carried by the overlay window itself: `move()` calls `setBounds` with
+the same coordinates `systemPointer.moveWindow` just sent, so the ring cannot drift
+from the window while it is being dragged. State changes are the only thing pushed
+into the page (`executeJavaScript`, a few per carry, never per frame).
+
+Details that are not incidental:
+
+- **`focusable: false` + `showInactive()`.** The window being carried must keep the
+  foreground: the PowerShell helper picks its grab target from the foreground
+  window, and a focus-stealing overlay would re-target the very grab it is drawing.
+- **Singleton + destroy on close.** `window-all-closed` quits the app, and it only
+  fires when *every* window is gone. A surviving overlay would either keep a
+  headless process alive after "close ORBIT" or leave a ghost ring on the desktop.
+  `mainWindow.on('closed')` disposes it first; `before-quit` does too.
+- **No green flash on a plain release.** `window.release` runs after
+  `handOffToTablet` has already flashed "sent"; `finish('dropped')` is skipped when
+  the hand-off fired, or the grey would paint over the green.
+
+Verified with a harness, `tools/carry-preview.mjs` (dev only, in `tools/`), which
+opens a mock app-like window, puts the real overlay on it, runs all four states and
+captures each one:
+
+- hold: ring hugs the window edge, badge readable, window content untouched.
+- aim: violet, obviously different at a glance, all four corners accented.
+- sent: mint green ring/glow, badge "SENT TO IPAD".
+- dragged +130/+60: `overlay bounds {328,188,924,584}` against expected
+  `{328,188,924,584}` - **ALIGNED**, exactly.
+
+The harness also turned up something worth writing down: on this machine *every*
+new `BrowserWindow` opens **maximised** - a bare frameless window reports
+`{-8,-8,1552,832}, isMaximized: true` at creation, before any code touches it. That
+is very likely why the close-button crash was reproducible here: a window created
+for the user is maximised, so the top-right of the screen is its Close button. The
+overlay is created with `show: false` and `focusable: false`, which kept it out of
+that behaviour, and `place()` is now re-asserted on `did-finish-load` in case it
+ever is not.
+
+`npm run typecheck` clean, `npm run build` clean, `272 passed, 0 failed`. The
+overlay was not seen during a real fist grab - that still needs the user's hand.
+
+---
+
+## 2026-11-16 (thirty-fifth pass) — "it crashes immediately after it boots" was a hand click on our own close button
+
+It never crashed. It quit, cleanly, because a gesture click landed on ORBIT's own
+Close button. The log says so twice:
+
+```
+15:53:23.796  ipc: Pointer press. {"x":1536,"y":0,"gaze":"laptop"}
+15:53:24.274  window: Window closed.
+15:53:24.289  app: All windows closed.
+15:53:24.314  app: Quitting.
+```
+
+No segmentation fault, no uncaught exception, no renderer death - `window closed`
+is Electron reporting a normal `close` event, so *something asked the window to
+close*. `(1536, 0)` is the top-right pixel of the primary display (1920x1080 at
+125% scaling). The top-right of a maximised window is its Close button, and
+Windows' caption hit-test reaches into the corner. A hand cursor parked there plus
+one pinch equals a quit that looks exactly like a crash.
+
+Why was the cursor in the corner at all? Two separate reasons:
+
+**1. The service emitted cursor positions before it had a neutral point.**
+`_effective_calibration` returns `None` while it is still sampling the palm, and
+`detect_pointer` reads `None` as "the middle of the camera frame is the middle of
+the screen". With `POINTER_POSITION_GAIN_X/Y` of 3.5/3.8, a hand 14% of a frame
+width off-centre already maps to the screen edge, so the first frames of every
+session could park the OS cursor in a corner before the user had done anything.
+The service now reports no hand at all until a neutral point exists, and the
+desktop's pointer handler holds the cursor where it is. No coordinates, no corner.
+
+**2. The saved calibration is from 12 November.** `services/gestures/
+calibration.json` still holds a neutral point of (0.547, 0.615) - a hand resting
+low in the frame. Held higher, the same mapping pins `y` to the top edge: the palm
+only has to anchor above 0.483. That is why the press was at `y: 0` exactly, and
+why the presses that followed - at x 1536, 1166, 941 - rode the top edge while the
+hand moved sideways. A deliberate calibration wins over auto-centring by design,
+so a stale one is fixed by the Calibrate button, not by code. Worth remembering:
+if the cursor feels stuck against an edge, re-calibrate.
+
+Three changes, in order of how much they matter:
+
+- **A hand click can no longer press ORBIT's own window buttons.** `isOwnCaptionButton`
+  refuses a gesture click inside the caption cluster (top 40 px, right 180 px) of
+  ORBIT's window while it has focus, and logs
+  `Ignored a hand click on ORBIT's own window buttons.` No gesture can minimise,
+  maximise or quit the app it is driving. Other apps' title bars are unaffected.
+- **No cursor before a neutral point** (above).
+- **`SCREEN_EDGE_INSET` (1.5%)** keeps the outermost pixels of the screen
+  unreachable by hand, so the cursor cannot sit on a resize border. The taskbar is
+  48 px tall at the bottom and stays reachable. The close-button corner is handled
+  by the caption guard instead of by geometry, because an inset small enough to
+  keep the screen usable is too small to miss a 46 px button.
+
+Verified: `npm run typecheck` clean, `npm run build` clean, `272 passed, 0 failed`
+in the gesture suite, `serve.py` compiles, the built main bundle contains the guard,
+and a replay of the logged coordinate through the new mapping gives `(1513, 13)` -
+still inside the caption cluster, which is why the guard is the fix that matters.
+Stack launched with the camera open and no new errors. **Not verified:** a real
+hand click on a real maximised window; that needs the user at the machine.
+
+---
+
 ## 2026-11-16 (thirty-fourth pass) — iPad tracking that survives a dropped frame, and a carry the tablet can finish
 
 Three reports, one cause between the first two.

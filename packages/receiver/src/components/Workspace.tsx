@@ -68,6 +68,13 @@ export function Workspace({
   const [optimistic, setOptimistic] = useState<Record<string, PanelRect>>({});
   const canvasRef = useRef<HTMLDivElement | null>(null);
   const [scale, setScale] = useState(1);
+  /**
+   * The canvas in CSS pixels.
+   *
+   * Needed for the single-panel case, which is drawn at screen size rather than at
+   * workspace-canvas size (see `solo` below).
+   */
+  const [viewport, setViewport] = useState({ width: 0, height: 0 });
 
   const mode = workspace?.mode ?? 'arrange';
   const canvasSize = workspace?.canvas ?? { width: 1024, height: 768 };
@@ -81,6 +88,7 @@ export function Workspace({
       const rect = el.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
       setScale(Math.min(rect.width / canvasSize.width, rect.height / canvasSize.height));
+      setViewport({ width: rect.width, height: rect.height });
     };
     update();
     const observer = new ResizeObserver(update);
@@ -128,10 +136,65 @@ export function Workspace({
 
   const selected = panels.find((p) => p.selected);
 
+  /**
+   * A window sent to the iPad fills it.
+   *
+   * Reported: "I put it on my iPad but it was a small black window… I need it to
+   * be a full scale window." The workspace canvas is a fixed 1024x768 logical
+   * space and new panels are sized to 55% x 50% of it, so a transferred window
+   * was drawn at about half scale in the middle of the iPad.
+   *
+   * There is nothing to arrange on a tablet - the user is not tidying a desktop,
+   * they are looking at one window - so every situation with at least one window
+   * is shown full-bleed, and the others are pages reachable with a left-fist
+   * swipe (or a finger swipe). The arrange canvas is not reachable from here at
+   * all; arranging happens on the laptop, where the mouse is.
+   */
+  const page = useMemo(() => {
+    if (panels.length === 0) return null;
+    return panels.find((p) => p.selected) ?? panels[0]!;
+  }, [panels]);
+  const pageIndex = page ? panels.findIndex((p) => p.id === page.id) : -1;
+  const solo = viewport.width > 0 ? page : null;
+
+  /** Page by one window; wraps, so the gesture never dead-ends. */
+  const pageBy = useCallback(
+    (step: number) => {
+      if (panels.length < 2 || pageIndex < 0) return;
+      const next = panels[(pageIndex + step + panels.length) % panels.length];
+      if (next) onSelect(next.id);
+    },
+    [panels, pageIndex, onSelect],
+  );
+
+  /**
+   * A finger swipe pages too.
+   *
+   * The gesture is a left fist, but a hand model can miss: this is the fallback
+   * that always works, and it is also how someone would try to do it first.
+   */
+  const touchStart = useRef<{ x: number; y: number } | null>(null);
+  const onCanvasPointerDown = useCallback((event: React.PointerEvent<HTMLElement>) => {
+    touchStart.current = { x: event.clientX, y: event.clientY };
+  }, []);
+  const onCanvasPointerUp = useCallback(
+    (event: React.PointerEvent<HTMLElement>) => {
+      const start = touchStart.current;
+      touchStart.current = null;
+      if (!start) return;
+      const dx = event.clientX - start.x;
+      const dy = event.clientY - start.y;
+      // Mostly horizontal, and long enough not to be a tap or a scroll.
+      if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.6) return;
+      pageBy(dx < 0 ? 1 : -1);
+    },
+    [pageBy],
+  );
+
   const resolveRect = (panel: Panel): PanelRect => optimistic[panel.id] ?? panel.rect;
 
   return (
-    <div className="ws">
+    <div className={solo ? 'ws ws-solo' : 'ws'}>
       <header className="ws-bar">
         <h2>Workspace</h2>
         <div className="mode-toggle" role="tablist" aria-label="Interaction mode">
@@ -173,11 +236,49 @@ export function Workspace({
         </div>
       )}
 
-      <div className="canvas" ref={canvasRef} onPointerDown={() => undefined}>
+      <div
+        className="canvas"
+        ref={canvasRef}
+        onPointerDown={onCanvasPointerDown}
+        onPointerUp={onCanvasPointerUp}
+      >
         {panels.length === 0 ? (
           <div className="canvas-empty">
             <span className="badge">No panels yet</span>
             <span>Grab a window on your laptop, look at this iPad, and open your hand to send it here.</span>
+          </div>
+        ) : solo ? (
+          <div className="canvas-solo">
+            <PanelView
+              panel={{ ...solo, rect: { x: 0, y: 0, width: viewport.width, height: viewport.height } }}
+              mode="interact"
+              stream={streams[solo.id]}
+              scale={1}
+              onSelect={onSelect}
+              onMove={handleMove}
+              onClose={onClose}
+              onReturn={onReturn}
+            />
+            {/* The window is the screen, so the controls float over it in one
+                thin strip instead of pushing it down. */}
+            <div className="solo-chrome">
+              <span className="solo-title">{solo.title}</span>
+              {panels.length > 1 ? (
+                <span className="solo-dots" aria-label={`Window ${pageIndex + 1} of ${panels.length}`}>
+                  {panels.map((panel) => (
+                    <button
+                      key={panel.id}
+                      className={panel.id === solo.id ? 'dot active' : 'dot'}
+                      onClick={() => onSelect(panel.id)}
+                      aria-label={panel.title}
+                    />
+                  ))}
+                </span>
+              ) : null}
+              <button className="solo-btn" onClick={() => onReturn(solo.id)}>
+                Back to laptop
+              </button>
+            </div>
           </div>
         ) : (
           <div

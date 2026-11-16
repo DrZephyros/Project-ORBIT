@@ -1,4 +1,12 @@
-import { ipcMain, screen, session, shell, type BrowserWindow, type desktopCapturer as desktopCapturerModule } from 'electron';
+import {
+  ipcMain,
+  screen,
+  session,
+  shell,
+  type BrowserWindow,
+  type NativeImage,
+  type desktopCapturer as desktopCapturerModule,
+} from 'electron';
 import QRCode from 'qrcode';
 import type { HandPointer, SourceCatalog, WorkspaceState } from '@orbit/shared';
 import type { OrbitClient } from './client.js';
@@ -6,6 +14,7 @@ import type { Settings } from './settings.js';
 import type { GestureBridge, PointerFrameMessage } from './gestures.js';
 import type { SystemPointer } from './system-pointer.js';
 import { log, logDirectory, logFile } from './log.js';
+import { carryIndicator } from './carry-indicator.js';
 import { EV, IPC, type OrbitPrefs, type OrbitStatus } from '../shared/ipc.js';
 
 interface Deps {
@@ -30,6 +39,28 @@ const GRANT_TTL_MS = 30_000;
  */
 const WINDOW_DRAG_EASING = 0.35;
 
+/**
+ * How far from the screen edge the hand cursor is allowed to go, as a fraction.
+ *
+ * A hand-driven cursor that can sit on the outermost pixel row is a cursor that
+ * can sit on a window's resize border, and at 0 the gain arithmetic clamps there
+ * for as long as the hand is beyond the neutral point. Keeping 1.5% of the
+ * screen unreachable leaves those edges to the mouse while still letting the
+ * cursor reach the taskbar (48 px tall at the bottom) and every control that is
+ * not literally on the frame.
+ */
+const SCREEN_EDGE_INSET = 0.015;
+
+/**
+ * Height of the caption band of ORBIT's own window, in DIP.
+ *
+ * Windows' title bar is a nominal 32 px and the buttons are drawn inside it; the
+ * extra few pixels are the hit padding around them.
+ */
+const CAPTION_BAND = 40;
+/** Width of the minimise/maximise/close cluster at the right of the caption. */
+const CAPTION_BUTTONS_WIDTH = 180;
+
 export function registerIpc({ client, settings, getWindow, desktopCapturer, gestures, systemPointer }: Deps): void {
   const emit = (channel: string, ...args: unknown[]): void => {
     const win = getWindow();
@@ -49,6 +80,28 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
    * still owed.
    */
   let osPressed = false;
+  /**
+   * Which real window each panel on the iPad is showing, by panel id.
+   *
+   * The renderer reports this when it hands a window over, because only it knows
+   * which panel the transfer produced. Everything the iPad then does - the
+   * cursor, the button, the keyboard - has to land on *that* window, so the
+   * mapping is the whole basis of the remote control.
+   */
+  const castWindows = new Map<string, string>();
+  /** When the iPad last steered a window on the laptop. */
+  let lastRemotePointerAt = 0;
+
+  /**
+   * True while the iPad is actually operating a window on this laptop.
+   *
+   * Used to decide whether a gesture made while looking at the iPad still has a
+   * meaning on the laptop. It does when the thing under the pointer is the window
+   * the iPad is controlling - scrolling it with the hand is one of the controls
+   * the user asked to have available from the tablet.
+   */
+  const remoteControllerActive = (): boolean =>
+    castWindows.size > 0 && lastRemotePointerAt !== 0 && Date.now() - lastRemotePointerAt < 3000;
   /** Which device owned the gesture when the current window grab started. */
   let grabOwner: 'laptop' | 'tablet' = 'laptop';
   /**
@@ -63,8 +116,25 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
   let grabHeld = false;
   /** When the carry started, so a lost hand cannot leave a window carried forever. */
   let grabHeldAt = 0;
+  /**
+   * The handle of the window the current carry picked up.
+   *
+   * Named in the hand-off event so the renderer can send *that* window to the
+   * iPad. It used to pick "the held panel, or the selected one", and a stale
+   * selection could send a different window than the one in the hand.
+   */
+  let grabHwnd: string | null = null;
   /** How long a half-finished carry is kept before it is forgotten. */
   const CARRY_TIMEOUT_MS = 30_000;
+  /**
+   * Whether the iPad has seen a *closed* hand during the current carry.
+   *
+   * The transfer ends on "the hand opened", and an iPad that has just started
+   * tracking reports an open hand on its first frame - which is not a release,
+   * it is a camera warming up. Without this, looking over at the iPad while
+   * carrying sent the window without any release gesture at all.
+   */
+  let tabletSawFist = false;
   /**
    * The iPad's report of whether the hand in front of it is a fist, and when.
    *
@@ -99,6 +169,12 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     screenTop: number;
     /** Set once the window has been pushed past the edge to hand to the iPad. */
     handedOff: boolean;
+    /**
+     * The window is not being physically dragged (the system pointer is off), so
+     * the ring stays where the window was picked up. Capture and sending still
+     * work; only the follow-the-hand part is skipped.
+     */
+    pinned: boolean;
   } | null = null;
   /** Invalidates an in-flight `grabWindow` when the grab is cancelled. */
   let windowGrabToken = 0;
@@ -108,6 +184,20 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
    */
   let tabletGaze: { looking: boolean | null; at: number } = { looking: null, at: 0 };
   const TABLET_GAZE_TTL_MS = 2500;
+  /**
+   * When the gaze was first decided as 'tablet', or 0.
+   *
+   * A glance at the iPad must not end a drag. Reported: "Moving of windows with
+   * the right fist is not reliable as it works but it is not continuous." The
+   * pointer frame handler ends the physical drag the moment the gaze is 'tablet',
+   * which is right for a deliberate hand-off - but one frame of head movement, or
+   * the iPad's own tracker reporting "looking" while the user glances at it
+   * mid-drag, stopped the window dead and it had to be picked up again. Requiring
+   * the gaze to stay there for `GAZE_SETTLE_MS` is the difference between "hand it
+   * over" and "keep dragging".
+   */
+  let gazeOnTabletSince = 0;
+  const GAZE_SETTLE_MS = 320;
 
   const tabletGazeFresh = (): boolean =>
     tabletGaze.looking !== null && Date.now() - tabletGaze.at <= TABLET_GAZE_TTL_MS;
@@ -196,12 +286,17 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     grabHeld = false;
     grabHeldAt = 0;
     endWindowDrag();
-    log.info('ipc', 'Window handed to the iPad.', { via });
+    // Flash green over the window that is leaving, so the hand-off is confirmed
+    // on the laptop too and not only on the tablet the user is looking at.
+    carryIndicator().finish('sent');
+    log.info('ipc', 'Window handed to the iPad.', { via, hwnd: grabHwnd });
     emit(EV.gestureEvent, {
       type: 'gesture',
       kind: 'window.handoff',
-      detail: { direction: 'gaze', gaze: 'tablet', via },
+      detail: { direction: 'gaze', gaze: 'tablet', via, hwnd: grabHwnd },
     });
+    // Cleared with the carry: a later hand-off must name its own window.
+    grabHwnd = null;
     return true;
   };
 
@@ -256,8 +351,51 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     attempt();
   };
 
+  /**
+   * Which capturable window belongs to the handle the fist is holding.
+   *
+   * Exact by handle first, because that is the only answer that cannot be wrong:
+   * a capture source id is `window:<hwnd>:<n>`, and the PowerShell helper returns
+   * the HWND it grabbed, so the two can simply be matched.
+   *
+   * The black-thumbnail filter is deliberately *not* applied to that exact match -
+   * a window that is momentarily black is still the window the user grabbed - and
+   * only guards the fallback.
+   */
+  const resolveGrabSource = async (hwnd: string): Promise<{ id: string; name: string } | null> => {
+    let sources: Awaited<ReturnType<typeof desktopCapturer.getSources>>;
+    try {
+      sources = await desktopCapturer.getSources({
+        types: ['window'],
+        thumbnailSize: { width: 320, height: 200 },
+        fetchWindowIcons: false,
+      });
+    } catch (error) {
+      log.warn('ipc', 'Could not list windows for the grabbed handle.', error);
+      return null;
+    }
+
+    const named = sources.filter((s) => Boolean(s.name?.trim()));
+    const exact =
+      named.find((s) => s.id === `window:${hwnd}:0`) ??
+      named.find((s) => s.id.startsWith(`window:${hwnd}:`));
+    if (exact) return { id: exact.id, name: exact.name };
+
+    const usable = named.filter((s) => {
+      const size = s.thumbnail.getSize();
+      if (size.width <= 0 || size.height <= 0) return false;
+      if (s.name.startsWith('ORBIT')) return false;
+      return thumbnailBrightness(s.thumbnail) > BLACK_THUMBNAIL_MAX;
+    });
+    const first = usable[0];
+    return first ? { id: first.id, name: first.name } : null;
+  };
+
   const beginWindowDrag = (): void => {
-    if (!settings.prefs.systemPointer) return;
+    // Resolving *which* window the fist is holding must happen even when the
+    // system pointer is off: with it off the window is not physically dragged,
+    // but it is still captured and can still be sent to the iPad.
+    const dragWindow = settings.prefs.systemPointer;
     // Capture the hand position now: the helper reply arrives a few frames
     // later, and using the position at reply time would jump the window.
     const grabX = lastPointer.x;
@@ -271,6 +409,7 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
         return;
       }
       log.info('ipc', 'Grabbed a window.', target);
+      grabHwnd = target.hwnd;
       const win = getWindow();
       const display =
         win && !win.isDestroyed()
@@ -288,7 +427,36 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
         screenLeft: display.bounds.x,
         screenTop: display.bounds.y,
         handedOff: false,
+        // With the system pointer off the ring is still drawn (it shows what
+        // was picked up) but `moveWindow` is never called for it.
+        pinned: !dragWindow,
       };
+      // Draw the "you are holding this" ring around the window that is about to
+      // move. Sized from the bounds the helper just measured, then dragged along
+      // with it below.
+      carryIndicator().show({
+        left: target.left,
+        top: target.top,
+        width: Math.max(1, target.right - target.left),
+        height: Math.max(1, target.bottom - target.top),
+      });
+      // Tell the renderer *which* window to capture, by handle.
+      //
+      // Reported: "it was a small black window with the title status." The
+      // renderer used to choose its capture source itself, from the front of a
+      // list it could not check, and a hidden helper window wins that race every
+      // time. The helper already knows the HWND it grabbed and a capture source id
+      // is `window:<hwnd>:0`, so the exact window is named instead of guessed.
+      void resolveGrabSource(target.hwnd).then((source) => {
+        if (token !== windowGrabToken) return;
+        if (!source) {
+          log.warn('ipc', 'The grabbed window has no capture source.', { hwnd: target.hwnd });
+          emit(EV.grabTarget, { hwnd: target.hwnd, sourceId: null, title: '' });
+          return;
+        }
+        log.info('ipc', 'Grab target resolved.', { hwnd: target.hwnd, source: source.id, name: source.name });
+        emit(EV.grabTarget, { hwnd: target.hwnd, sourceId: source.id, title: source.name });
+      });
     });
   };
 
@@ -329,10 +497,39 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     const bounds = display.bounds;
     const cx = Math.min(1, Math.max(0, x));
     const cy = Math.min(1, Math.max(0, y));
+    // Inset, so the outermost few percent of the screen is unreachable by hand.
+    const fx = SCREEN_EDGE_INSET + cx * (1 - 2 * SCREEN_EDGE_INSET);
+    const fy = SCREEN_EDGE_INSET + cy * (1 - 2 * SCREEN_EDGE_INSET);
     return {
-      x: Math.round(bounds.x + cx * bounds.width),
-      y: Math.round(bounds.y + cy * bounds.height),
+      x: Math.round(bounds.x + fx * bounds.width),
+      y: Math.round(bounds.y + fy * bounds.height),
     };
+  };
+
+  /**
+   * True when a point falls on ORBIT's own minimise/maximise/close buttons.
+   *
+   * Reported: "it crashes immediately after it boots."
+   *
+   * The log showed a gesture press at exactly the top-right corner of the screen
+   * 0.5 s after startup, followed by "Window closed" and a clean quit - not a
+   * crash at all. The hand cursor had been clamped into that corner, and the
+   * top-right corner of a maximised window *is* its close button. The process was
+   * doing exactly what it was told.
+   *
+   * The service no longer emits a position before it has learned a neutral
+   * point, which is what put the cursor there. This is the second line of
+   * defence: a hand-driven click can never press a control that quits the app it
+   * is being used to control. Only ORBIT's own window is affected, and only while
+   * it has focus, so clicking another app's title bar still works.
+   */
+  const isOwnCaptionButton = (point: { x: number; y: number }): boolean => {
+    const win = getWindow();
+    if (!win || win.isDestroyed() || win.isMinimized() || !win.isFocused()) return false;
+    const bounds = win.getBounds();
+    const inBand = point.y >= bounds.y && point.y <= bounds.y + CAPTION_BAND;
+    const inCluster = point.x >= bounds.x + bounds.width - CAPTION_BUTTONS_WIDTH && point.x <= bounds.x + bounds.width;
+    return inBand && inCluster;
   };
 
   const status = (): OrbitStatus => ({
@@ -370,6 +567,11 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     if (looking === true) {
       releaseOsPointer();
       endWindowDrag();
+      // The ring stays - the window is still in the hand - but it now says what
+      // the next move is, which is the one thing the user could not see.
+      if (grabHeld) carryIndicator().setState('aim');
+    } else if (grabHeld) {
+      carryIndicator().setState('hold');
     }
     // A fresh opinion - including "I can no longer see a face" - supersedes the
     // last pointer frame's routing.
@@ -408,18 +610,82 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     const previousAt = tabletFistAt;
     tabletFist = fist;
     tabletFistAt = Date.now();
-    if (fist) return;
+    if (fist) {
+      if (grabHeld) tabletSawFist = true;
+      return;
+    }
     log.debug('ipc', 'iPad reports the hand open.', {
       carrying: grabHeld,
       afterFistFor: previousAt === 0 ? null : tabletFistAt - previousAt,
     });
     if (!grabHeld) return;
+    if (!tabletSawFist) {
+      // A hand that was never seen closed cannot have opened.
+      log.debug('ipc', 'Ignored an iPad release: no fist was seen in this carry.');
+      return;
+    }
     // The release only means "send it" if the head is on the iPad. A hand that
     // opens while the user is still looking at the laptop is the laptop's own
     // release path, which the service will report itself.
     if (!tabletGazeFresh() || tabletGaze.looking !== true) return;
     handOffToTablet('tablet-fist');
   });
+  /**
+   * Move the real cursor to a position on the window the iPad is showing.
+   *
+   * Requested: "my hand movements should not control a dummy cursor. It should
+   * control a working one." The iPad's cursor used to be a drawing with DOM
+   * events dispatched under it; that can press ORBIT's own buttons but cannot
+   * operate a real application. So a position inside the panel is mapped onto the
+   * window's actual bounds and the Windows cursor is moved there.
+   */
+  client.on('remotePointer', (panelId: string, x: number, y: number, kind: string) => {
+    const hwnd = castWindows.get(panelId);
+    if (!hwnd) return;
+    lastRemotePointerAt = Date.now();
+    void systemPointer.bounds(hwnd).then((rect) => {
+      if (!rect) {
+        // The window is gone (closed, or on another desktop). Forget it rather
+        // than aiming clicks at a stale rectangle.
+        castWindows.delete(panelId);
+        return;
+      }
+      const width = Math.max(1, rect.right - rect.left);
+      const height = Math.max(1, rect.bottom - rect.top);
+      const px = Math.round(rect.left + x * width);
+      const py = Math.round(rect.top + y * height);
+      if (kind === 'down') {
+        systemPointer.place(px, py);
+        systemPointer.press(px, py);
+        osPressed = true;
+        return;
+      }
+      if (kind === 'up') {
+        systemPointer.place(px, py);
+        if (osPressed) {
+          osPressed = false;
+          systemPointer.release();
+        }
+        return;
+      }
+      systemPointer.place(px, py);
+    });
+  });
+
+  /**
+   * Type on the iPad, into the window on the iPad.
+   *
+   * The window is focused first: a keystroke has no position, so unlike a click
+   * there is nothing that tells the shell which window it was meant for.
+   */
+  client.on('remoteKey', (panelId: string, text?: string, key?: string) => {
+    const hwnd = castWindows.get(panelId);
+    if (!hwnd) return;
+    systemPointer.focus(hwnd);
+    if (text) systemPointer.typeText(text);
+    if (key) systemPointer.pressKey(key);
+  });
+
   client.on('welcome', ({ session: s, pairing }) => {
     if (pairing) emit(EV.pairing, pairing);
     emit(EV.status, { ...status(), session: s, pairing: pairing ?? client.pairing });
@@ -435,8 +701,14 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     if (msg.t === 'server.workspace') emit(EV.workspace, msg.state);
   });
   client.on('panelSelect', (id: string) => emit(EV.panelSelect, id));
-  client.on('panelClose', (id: string) => emit(EV.panelClose, id));
-  client.on('panelReturn', (id: string) => emit(EV.panelReturn, id));
+  client.on('panelClose', (id: string) => {
+    castWindows.delete(id);
+    emit(EV.panelClose, id);
+  });
+  client.on('panelReturn', (id: string) => {
+    castWindows.delete(id);
+    emit(EV.panelReturn, id);
+  });
   client.on('panelMove', (id: string, rect: unknown) => emit(EV.panelMove, id, rect));
   client.on('modeSet', (mode: string) => emit(EV.modeSet, mode));
   client.on('command', (text: string, mode: string) => emit(EV.command, text, mode));
@@ -545,7 +817,12 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
         // filter that would have stopped 'status' from being offered at all.
         const size = s.thumbnail.getSize();
         if (size.width <= 0 || size.height <= 0) return false;
-        return true;
+        // ...and a uniformly black thumbnail has no surface either, even though it
+        // reports a size. That is what the size check missed: a hidden helper
+        // window named "Status" enumerates with a 158x200 all-black thumbnail,
+        // sits at the top of the z-order, and so became the first entry here -
+        // which is the window a fist picked up.
+        return thumbnailBrightness(s.thumbnail) > BLACK_THUMBNAIL_MAX;
       })
       .map((s) => ({
         id: s.id,
@@ -554,6 +831,20 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
         thumbnailDataUrl:
           wantsThumbs && !s.thumbnail.isEmpty() ? s.thumbnail.toDataURL() : undefined,
       }));
+  });
+
+  /**
+   * Remember which window a handed-off panel is showing.
+   *
+   * `hwnd` is the handle the fist actually grabbed, which the renderer already
+   * holds from `orbit:ev-grab-target`. Passing it here is what lets every later
+   * pointer event find the real window instead of guessing at the frontmost one.
+   */
+  ipcMain.handle(IPC.registerCastPanel, (_e, panelId: string, hwnd: string | null) => {
+    if (typeof panelId !== 'string' || !panelId) return { ok: false };
+    if (typeof hwnd === 'string' && /^\d+$/.test(hwnd)) castWindows.set(panelId, hwnd);
+    else castWindows.delete(panelId);
+    return { ok: true };
   });
 
   ipcMain.handle(IPC.grantCapture, (_e, sourceId: string) => {
@@ -644,6 +935,13 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     if (p) await shell.openExternal(p.url);
   });
 
+  ipcMain.handle(IPC.newPairingCode, () => {
+    if (!client.requestPairing()) {
+      return { ok: false, message: 'Not connected to the local server yet. Try again in a moment.' };
+    }
+    return { ok: true, message: 'New code issued. It replaces the old one straight away.' };
+  });
+
   ipcMain.handle(IPC.openLogFolder, async () => {
     const dir = logDirectory();
     log.info('ipc', 'Opening the log folder.', { dir });
@@ -721,6 +1019,10 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
         if (!settings.prefs.systemPointer || gaze === 'tablet') return;
         if (!Number.isFinite(x) || !Number.isFinite(y)) return;
         const point = toScreenPoint(x, y);
+        if (isOwnCaptionButton(point)) {
+          log.warn('ipc', 'Ignored a hand click on ORBIT\'s own window buttons.', point);
+          return;
+        }
         log.info('ipc', 'Pointer press.', { x: point.x, y: point.y, gaze });
         systemPointer.press(point.x, point.y);
         osPressed = true;
@@ -744,7 +1046,12 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
       // One wheel event per notch, in the notch's own direction. The service
       // has already accumulated slow hand movement, so this is the only place
       // that needs to know Windows uses 120 units per detent.
-      if (!settings.prefs.systemPointer || gaze === 'tablet') return;
+      if (!settings.prefs.systemPointer) return;
+      // The wheel goes wherever the cursor is, and while the iPad is driving a
+      // window the cursor is on that window - so the scroll belongs to it. With
+      // nothing under remote control, a scroll aimed at the iPad has no laptop
+      // meaning and is dropped, as before.
+      if (gaze === 'tablet' && !remoteControllerActive()) return;
       if (Number.isFinite(notches) && notches !== 0) systemPointer.wheel(notches);
       return;
     }
@@ -771,6 +1078,31 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
       // concept with no counterpart on the tablet, so there is nothing to route.
       // Only the master switch (systemPointer) still applies.
       if (!settings.prefs.systemPointer) return;
+
+      // One gesture, two meanings, chosen by which screen the user is on.
+      //
+      // Requested: "enable swiping between windows that are transferred to the
+      // iPad with the left closed fist motions, when I am looking at the iPad",
+      // and separately "changing between desktops when I am looking at the
+      // laptop". A four-finger trackpad swipe means "slide to the next screen in
+      // that direction", and which screens those are depends on where the head
+      // is pointing - desktops on the laptop, cast windows on the iPad.
+      //
+      // The tablet's own gaze is the witness, not `lastPointer.gaze`: once the
+      // head turns to the iPad the laptop's webcam loses the face, so only the
+      // iPad can still say where the user is looking (see `tabletGazeFresh`).
+      // The service's own router is the fallback for an iPad that is not
+      // reporting (camera off, or booting): `lastPointer.gaze` is recomputed from
+      // the live frame every pointer update, so it means what it says here.
+      const onTablet = tabletGazeFresh()
+        ? tabletGaze.looking === true
+        : lastPointer.gaze === 'tablet';
+      if (onTablet) {
+        log.info('ipc', 'Panel swipe.', { direction });
+        emit(EV.cyclePanel, direction === 'left' ? 'left' : 'right');
+        return;
+      }
+
       log.info('ipc', 'Desktop switch.', { direction });
       systemPointer.switchDesktop(direction === 'left' ? -1 : 1);
       // ORBIT is the screen the user is controlling from, so it must not ride
@@ -802,6 +1134,7 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
       // A new carry, from the only camera that can see it start.
       grabHeld = true;
       grabHeldAt = Date.now();
+      tabletSawFist = false;
       emit(EV.gestureEvent, msg);
       // The renderer adds the captured panel; this moves the real window too.
       beginWindowDrag();
@@ -846,6 +1179,9 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
       // The carry is over either way: released, sent, or nowhere to go.
       grabHeld = false;
       grabHeldAt = 0;
+      grabHwnd = null;
+      // A hand-off already flashed green; grey over the top would erase it.
+      if (!sent) carryIndicator().finish('dropped');
       return;
     }
 
@@ -863,6 +1199,7 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
         if (resolveGaze(undefined) !== 'tablet') {
           grabHeld = false;
           grabHeldAt = 0;
+          carryIndicator().finish('dropped');
         }
       }
     }
@@ -937,6 +1274,10 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     lastPointer.x = x;
     lastPointer.y = y;
     const point = toScreenPoint(x, y);
+    if (isOwnCaptionButton(point)) {
+      log.warn('ipc', 'Ignored a hand click on ORBIT\'s own window buttons.', point);
+      return;
+    }
     systemPointer.click(point.x, point.y);
   });
   gestures.on('pointer', (frame: PointerFrameMessage) => {
@@ -946,6 +1287,7 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     if (!frame.armed) {
       releaseOsPointer();
       endWindowDrag();
+      if (grabHeld) carryIndicator().finish('dropped');
       grabHeld = false;
       grabHeldAt = 0;
       return;
@@ -974,9 +1316,18 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     // toward where the iPad would be. Otherwise movement stops at the worst
     // possible moment and the user reasonably reads it as "gestures are broken".
     const gaze = decided === 'tablet' && !receiverConnected() ? 'laptop' : decided;
-    lastPointer.gaze = gaze;
-
+    // Hold the decision for a moment before it is allowed to take the window
+    // away from the laptop. See `gazeOnTabletSince`.
+    let settled = true;
     if (gaze === 'tablet') {
+      if (gazeOnTabletSince === 0) gazeOnTabletSince = Date.now();
+      settled = Date.now() - gazeOnTabletSince >= GAZE_SETTLE_MS;
+    } else {
+      gazeOnTabletSince = 0;
+    }
+    lastPointer.gaze = settled ? gaze : 'laptop';
+
+    if (settled && gaze === 'tablet') {
       // The hand follows the head: while the user looks at the iPad the OS
       // cursor stays put and the receiver draws the local iPad cursor instead.
       // The physical drag ends too - the window must not travel to a screen it
@@ -989,6 +1340,7 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
       if (grabHeld && grabHeldAt !== 0 && Date.now() - grabHeldAt > CARRY_TIMEOUT_MS) {
         grabHeld = false;
         grabHeldAt = 0;
+        carryIndicator().finish('dropped');
       }
       return;
     }
@@ -1098,7 +1450,8 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     const sendY = restingOnLaptop
       ? Math.min(Math.max(windowDrag.smoothY, clampMinY), clampMaxY)
       : windowDrag.smoothY;
-    systemPointer.moveWindow(sendX, sendY);
+    if (!windowDrag.pinned) systemPointer.moveWindow(sendX, sendY);
+    carryIndicator().move(sendX, sendY);
   });
   gestures.on('error', (message: string) => {
     log.error('ipc', 'Gesture bridge reported an error.', message);
@@ -1167,6 +1520,36 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
   });
   ipcMain.handle(IPC.gestureState, () => ({ state: gestures.state, error: null }));
 }
+
+/**
+ * Mean brightness of a window thumbnail, 0..255.
+ *
+ * Used to recognise windows that have no pixels to capture. On this machine a
+ * Wispr Flow helper window titled "Status" sits above everything in the window
+ * list, enumerates with a normal name and a non-zero thumbnail size, and
+ * captures as pure black - so it passed every earlier check and became
+ * "a small black window with the title status" on the iPad.
+ */
+function thumbnailBrightness(image: NativeImage): number {
+  try {
+    const { width, height } = image.getSize();
+    if (width <= 0 || height <= 0) return 0;
+    const data = image.resize({ width: 8, height: 8, quality: 'good' }).toBitmap();
+    let sum = 0;
+    let count = 0;
+    for (let i = 0; i + 3 < data.length; i += 4) {
+      sum += (data[i]! + data[i + 1]! + data[i + 2]!) / 3;
+      count += 1;
+    }
+    return count === 0 ? 0 : sum / count;
+  } catch {
+    // A thumbnail that cannot be read is not evidence of content.
+    return 0;
+  }
+}
+
+/** Below this, a thumbnail is indistinguishable from a window with no pixels. */
+const BLACK_THUMBNAIL_MAX = 2;
 
 function asStringList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];

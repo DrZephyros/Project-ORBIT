@@ -178,7 +178,39 @@ export type DesktopRelayMessage =
    * half of it happens with the laptop's webcam pointed at the back of a head.
    * The tablet is the only camera that can see that release, so it reports it.
    */
-  | { t: 'server.fist.tablet'; fist: boolean; at: number };
+  | { t: 'server.fist.tablet'; fist: boolean; at: number }
+  /**
+   * Remote input from the iPad onto the window it is showing.
+   *
+   * Requested: "when I transfer the window, all controls to that window must be
+   * available on the iPad... my hand movements should not control a dummy cursor.
+   * It should control a working one."
+   *
+   * `x`/`y` are fractions of the *panel*, not of the iPad screen, so the desktop
+   * can map them onto the real window wherever it happens to be without the
+   * tablet knowing anything about the laptop's layout.
+   */
+  | {
+      t: 'server.remote.pointer';
+      panelId: string;
+      x: number;
+      y: number;
+      kind: 'move' | 'down' | 'up';
+      at: number;
+    }
+  /**
+   * A keystroke typed on the iPad's keyboard for the window it is showing.
+   *
+   * `text` is printable text; `key` is one of the named keys a soft keyboard
+   * sends that are not text at all.
+   */
+  | {
+      t: 'server.remote.key';
+      panelId: string;
+      text?: string;
+      key?: RemoteKeyName;
+      at: number;
+    };
 
 export interface StreamTarget {
   panelId: string;
@@ -187,6 +219,18 @@ export interface StreamTarget {
   height: number;
   fps: number;
 }
+
+/** Named keys a soft keyboard can send that carry no printable text. */
+export type RemoteKeyName =
+  | 'Enter'
+  | 'Backspace'
+  | 'Tab'
+  | 'Escape'
+  | 'ArrowLeft'
+  | 'ArrowRight'
+  | 'ArrowUp'
+  | 'ArrowDown'
+  | 'Delete';
 
 /** Which physical screen the user's head is currently aimed at. */
 export type ScreenTarget = 'laptop' | 'tablet';
@@ -330,6 +374,27 @@ export type ClientMessage =
     }
   | {
       /**
+       * Remote input aimed at a window this iPad is showing.
+       *
+       * The cursor, the button and the keyboard all travel the same way as the
+       * eye tracking already does: a small typed message, never a frame.
+       */
+      t: 'receiver.remote.pointer';
+      panelId: string;
+      x: number;
+      y: number;
+      kind: 'move' | 'down' | 'up';
+      at: number;
+    }
+  | {
+      t: 'receiver.remote.key';
+      panelId: string;
+      text?: string;
+      key?: RemoteKeyName;
+      at: number;
+    }
+  | {
+      /**
        * The iPad's own hand tracker: is the hand it can see a closed fist?
        *
        * Sent on every change, so the laptop can tell a *release* (fist -> open)
@@ -357,6 +422,15 @@ export type ClientMessage =
   | { t: 'desktop.transcript'; transcript: TranscriptEvent }
   | { t: 'desktop.voice.state'; state: 'idle' | 'listening' | 'transcribing' }
   | { t: 'desktop.device.revoke'; receiverId: string }
+  /**
+   * "That code expired, give me a new one."
+   *
+   * The server only ever *pushed* codes (on hello, on session start, and when a
+   * receiver was rejected), so a code that reached its five minute expiry left the
+   * Setup page counting down to 0:00 with nothing to press and no way back except
+   * restarting the whole app. The desktop can now ask.
+   */
+  | { t: 'desktop.pairing.request' }
   | { t: 'desktop.ping'; at: number }
   | { t: 'server.ping'; at: number }
   // server -> both

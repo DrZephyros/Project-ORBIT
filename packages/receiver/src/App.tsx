@@ -6,6 +6,7 @@ import { useTabletTracking } from './lib/tablet-tracking.js';
 import { PairingScreen } from './components/PairingScreen.js';
 import { StandbyScreen } from './components/StandbyScreen.js';
 import { Workspace, type LiveOverlays } from './components/Workspace.js';
+import { RemoteKeyboard } from './components/RemoteKeyboard.js';
 
 export function App() {
   const link = useOrbitLink();
@@ -40,6 +41,36 @@ export function App() {
   }, []);
   /** Element the relayed pinch pressed, so the up finishes on the same target. */
   const downTarget = useRef<Element | null>(null);
+  /**
+   * The panel filling this screen, if the user is looking at a transferred
+   * window rather than at ORBIT's own iPad UI.
+   *
+   * Reported: "all controls to that window must be available on the iPad... my
+   * hand movements should not control a dummy cursor. It should control a
+   * working one." So while a panel is showing, the hand stops poking at the DOM
+   * underneath it and sends its position to the laptop instead, where the real
+   * cursor is moved to the real window.
+   */
+  const remotePanelRef = useRef<string | null>(null);
+  /** True while a transferred window owns this screen. */
+  const [remoteWindow, setRemoteWindow] = useState<string | null>(null);
+
+  /**
+   * Send a pointer event to the window on this screen.
+   *
+   * Returns false when there is no window to send it to, so the caller can fall
+   * back to the local DOM - that is the behaviour for ORBIT's own UI, which must
+   * keep working exactly as before.
+   */
+  const sendRemotePointer = useCallback(
+    (kind: 'move' | 'down' | 'up', x: number, y: number): boolean => {
+      const panelId = remotePanelRef.current;
+      if (!panelId) return false;
+      void link.send({ t: 'receiver.remote.pointer', panelId, x, y, kind, at: Date.now() });
+      return true;
+    },
+    [link],
+  );
 
   const activate = useCallback(
     (x: number, y: number) => {
@@ -66,6 +97,9 @@ export function App() {
    */
   const localDownTarget = useRef<Element | null>(null);
   const localDown = useCallback((x: number, y: number) => {
+    // A transferred window is not a picture of one: pressing the hand over it
+    // presses the real button underneath, in the real application.
+    if (sendRemotePointer('down', x, y)) return;
     const el = document.elementFromPoint(x * window.innerWidth, y * window.innerHeight);
     localDownTarget.current = el;
     if (!el) return;
@@ -84,9 +118,10 @@ export function App() {
       }),
     );
     el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY, button: 0, buttons: 1 }));
-  }, []);
+  }, [sendRemotePointer]);
   const localUp = useCallback(
     (x: number, y: number) => {
+      if (sendRemotePointer('up', x, y)) return;
       const pressedEl = localDownTarget.current;
       localDownTarget.current = null;
       const clientX = x * window.innerWidth;
@@ -112,12 +147,28 @@ export function App() {
       const sameTarget = !pressedEl || !el || pressedEl === el || pressedEl.contains(el) || el.contains(pressedEl);
       if (sameTarget) activate(x, y);
     },
-    [activate],
+    [activate, sendRemotePointer],
   );
+  /**
+   * Page through the windows on this iPad, one step at a time.
+   *
+   * Held in a ref because the tracker's options are installed once, while the
+   * panel list and the select callback are recreated as state changes.
+   */
+  const pageByRef = useRef<((step: number) => void) | null>(null);
+
   const tracker = useTabletTracking({
     onDown: localDown,
     onUp: localUp,
-    onPointer: (position) => setCursor(position ? position.x : null, position?.y),
+    onPointer: (position) => {
+      // Both: the position drives the real cursor on the laptop, and the dot is
+      // still drawn here. The dot is not a substitute for the real cursor any
+      // more - it is the low-latency copy of it. A captured window does not
+      // include the Windows pointer, and the video is a round trip behind the
+      // hand, so without the dot the user would be aiming blind for ~100 ms.
+      if (position) sendRemotePointer('move', position.x, position.y);
+      setCursor(position ? position.x : null, position?.y);
+    },
     onGaze: (looking) => {
       // Only a small opinion crosses the wire; the camera frames never do.
       void link.send({ t: 'receiver.gaze', looking, at: Date.now() });
@@ -126,6 +177,12 @@ export function App() {
       // The laptop cannot see the hand once the head has turned to this iPad, so
       // this is its only report of the moment the carry gesture finishes.
       void link.send({ t: 'receiver.fist', fist, at: Date.now() });
+    },
+    onSwipe: (direction) => {
+      // A closed hand slid sideways over this screen: the same "slide to the next
+      // screen" as the laptop's desktop swipe, but here the screens are the
+      // windows that have been sent over.
+      pageByRef.current?.(direction === 'left' ? -1 : 1);
     },
   });
 
@@ -357,6 +414,29 @@ export function App() {
     [link.workspace, myPanels],
   );
 
+  /**
+   * The window on this screen, if any.
+   *
+   * Solo mode shows one panel full-bleed, so "the window the user is operating"
+   * is simply the selected panel. Anything the hand does goes to it; when there
+   * is no panel, everything behaves as it did before and the hand drives this
+   * page's own controls.
+   */
+  const shownPanel = myPanels.find((panel) => panel.selected) ?? myPanels[0] ?? null;
+  const shownPanelId = shownPanel?.id ?? null;
+  remotePanelRef.current = shownPanelId;
+  if (remoteWindow !== shownPanelId) setRemoteWindow(shownPanelId);
+
+  // Assigned during render, like the stream callbacks above: the tracker reads
+  // it through a ref so it never holds a stale panel list.
+  pageByRef.current = (step: number) => {
+    if (myPanels.length < 2) return;
+    const index = myPanels.findIndex((panel) => panel.selected);
+    const base = index === -1 ? 0 : index;
+    const next = myPanels[(base + step + myPanels.length) % myPanels.length];
+    if (next) onSelect(next.id);
+  };
+
   if (
     link.state === 'unpaired' ||
     link.state === 'pairing' ||
@@ -427,6 +507,8 @@ export function App() {
 
       {/* Always mounted: its transform is written from the tracking loop. */}
       <div ref={cursorEl} className="hand-cursor" aria-hidden="true" />
+
+      <RemoteKeyboard panelId={remoteWindow} link={link} />
 
       {/*
         The camera only starts from a real tap: Safari refuses getUserMedia from

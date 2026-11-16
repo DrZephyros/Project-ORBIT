@@ -38,6 +38,11 @@ export interface DesktopChannel {
   requestSources: (options: { thumbnails: boolean }) => Promise<WindowSource[]>;
   /** Ask the main process to authorise capture of this source id for the next getDisplayMedia call. */
   grantCapture: (sourceId: string) => Promise<{ ok: boolean; reason?: string }>;
+  /**
+   * Tell the main process which real window a panel on the iPad is showing, so
+   * the iPad's pointer and keyboard can reach it. `null` forgets the mapping.
+   */
+  registerCastPanel: (panelId: string, hwnd: string | null) => Promise<{ ok: boolean }>;
   startSession: (catalog: SourceCatalog) => Promise<void>;
   stopSession: () => Promise<void>;
   setActiveSource: (sourceId: string | null) => Promise<void>;
@@ -55,6 +60,14 @@ export interface DesktopChannel {
     phase?: 'move' | 'click' | 'down' | 'up',
   ) => Promise<void>;
   revoke: (receiverId: string) => Promise<void>;
+  /**
+   * Rotate the pairing code and hand back the new one.
+   *
+   * A code lives for five minutes. When it ran out the Setup page simply showed
+   * 0:00 forever: the server only ever pushed codes on its own initiative, so the
+   * only way to pair after that was restarting ORBIT. This asks for a new one.
+   */
+  newPairingCode: () => Promise<{ ok: boolean; message: string }>;
   pushTask: (task: TaskState | null) => Promise<void>;
   pushApproval: (approval: ApprovalRequest | null) => Promise<void>;
   pushTranscript: (event: TranscriptEvent | null) => Promise<void>;
@@ -100,6 +113,8 @@ export interface DesktopEvents {
   stop: () => void;
   approvalResponse: (approvalId: string, accept: boolean) => void;
   pairing: (pairing: PairingOffer) => void;
+  grabTarget: (target: { hwnd: string; sourceId: string | null; title: string }) => void;
+  cyclePanel: (direction: 'left' | 'right') => void;
   /** The receiver answered our offer. */
   answer: (panelId: string, sdp: string) => void;
   iceRemote: (panelId: string, candidate: { candidate: string; sdpMid: string | null; sdpMLineIndex: number | null }) => void;
@@ -112,6 +127,7 @@ export const IPC = {
   setPrefs: 'orbit:set-prefs',
   requestSources: 'orbit:request-sources',
   grantCapture: 'orbit:grant-capture',
+  registerCastPanel: 'orbit:register-cast-panel',
   startSession: 'orbit:start-session',
   stopSession: 'orbit:stop-session',
   setActiveSource: 'orbit:set-active-source',
@@ -121,6 +137,7 @@ export const IPC = {
   streamStop: 'orbit:stream-stop',
   pushPointer: 'orbit:push-pointer',
   revoke: 'orbit:revoke',
+  newPairingCode: 'orbit:new-pairing-code',
   pushTask: 'orbit:push-task',
   pushApproval: 'orbit:push-approval',
   pushTranscript: 'orbit:push-transcript',
@@ -156,5 +173,18 @@ export const EV = {
   error: 'orbit:ev-error',
   gestureStatus: 'orbit:ev-gesture-status',
   gestureEvent: 'orbit:ev-gesture-event',
+  /**
+   * Which capture source the fist is actually holding, resolved by window handle.
+   * `sourceId` is null when the grabbed window has no capturable surface.
+   */
+  grabTarget: 'orbit:ev-grab-target',
+  /**
+   * Move to the next or previous window on the iPad.
+   *
+   * A left-hand fist swipe is one gesture with two meanings, chosen by where the
+   * user is looking: over the iPad it pages through the windows sent there, and
+   * over the laptop it slides virtual desktops.
+   */
+  cyclePanel: 'orbit:ev-cycle-panel',
   gestureState: 'orbit:ev-gesture-state',
 } as const;

@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,7 @@ from orbit_gestures.geometry import (  # noqa: E402
     calibration_from,
     detect_fist,
     detect_pointer,
+    left_fist_closed,
     finger_curls,
     finger_curls_3d,
     landmark_payload,
@@ -606,6 +608,29 @@ class GestureService:
                 world_hand=world_hand,
                 calibration=self._effective_calibration(anchor),
             )
+            # No neutral point yet means no usable cursor position.
+            #
+            # `detect_pointer` treats a missing calibration as "the middle of the
+            # camera frame is the middle of the screen", which is only true if
+            # the user happens to hold their hand dead centre. With the gain that
+            # makes a comfortable sweep cross the screen, a hand even slightly
+            # off-centre maps to an edge - and the first frames after every
+            # launch are exactly when no neutral point has been learned yet.
+            #
+            # Reported as "it crashes immediately after it boots": the cursor was
+            # pinned to the top-right corner of the screen while the auto-centre
+            # was still sampling, and the next pinch landed on ORBIT's own close
+            # button. So until a neutral point exists the service reports no
+            # hand, and the desktop holds the cursor wherever it already is.
+            if self.calibration is None and self._auto_center is None and pointer.hand_visible:
+                pointer = dataclass_replace(
+                    pointer,
+                    x=0.0,
+                    y=0.0,
+                    pinch=False,
+                    hand_visible=False,
+                    reason="finding neutral point",
+                )
             fist = detect_fist(
                 hand,
                 face,
@@ -624,6 +649,10 @@ class GestureService:
                 # it, so a settled fist is measured for the grab band again.
                 scrolling=pointer.scrolling and self.machine.scrolling,
                 world_hand=world_hand,
+                # Once a window is held, the fist owns the frame: the far edge of
+                # the pickup band must not end the drag when the hand sweeps out
+                # to the side. See `detect_fist`'s `held` note.
+                held=self.machine.grab_active,
             )
             if pointer.hand_visible:
                 self.pointer = self.smoother.update((pointer.x, pointer.y), now_ms)
@@ -697,8 +726,11 @@ class GestureService:
                     if left_index < len(result.world_hands)
                     else None
                 )
-                left_reading = detect_fist(left_hand, face, world_hand=left_world)
-                if left_reading.in_front:
+                # A closed left hand anywhere in frame, not just in the grab
+                # band. The swipe is measured from the hand's own travel, and
+                # requiring the mouth-distance band meant a hand held out to the
+                # side - where a swipe begins - was never recognised at all.
+                if left_fist_closed(left_hand, world_hand=left_world):
                     left_anchor = pointer_anchor(left_hand)
                     if left_anchor is not None:
                         left_fist = True

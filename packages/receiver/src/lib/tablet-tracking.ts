@@ -111,16 +111,31 @@ const FIST_LOST_GRACE_MS = 600;
 // 1.4 means roughly +/-0.35 of hand travel spans the full width: the same
 // comfortable sweep the laptop pointer uses, with headroom so the edges are
 // reachable deliberately rather than accidentally.
-const GAIN_X = 1.4;
-const GAIN_Y = 1.5;
-// Lighter smoothing than before. Heavy smoothing on top of an over-amplified
-// signal is what made it feel both twitchy and laggy at once.
-const SMOOTHING = 0.6;
-// A genuine jump guard, not a governor. At 0.55 a real fast movement was being
-// discarded outright, so the cursor would freeze mid-sweep.
-const MAX_JUMP = 0.85;
-/** Below this distance from the learned centre, the hand counts as still. */
-const DEAD_ZONE = 0.014;
+//
+// Requested: "increase the mouse sensitivity on the iPad." The laptop's own
+// pointer moves at 3.5/3.8 screen fractions per face width (geometry.py); the
+// iPad was at 1.4/1.5, so it needed more than twice the hand travel for the same
+// distance. That is the whole difference between "the cursor is sluggish" and
+// "it goes where I put my hand". Matched to the laptop's pair, slightly lower on
+// X: the iPad is held closer to the body, so the same arm sweep covers more of
+// its camera frame.
+const GAIN_X = 3.1;
+const GAIN_Y = 3.4;
+// More gain means a noisier signal, so the smoothing stays. Lower than the
+// laptop's 0.30 because a heavier hand jitters far more than a pointing finger,
+// and this is a finger-free pose by definition.
+const SMOOTHING = 0.45;
+// A genuine jump guard, not a governor. Raised in step with the gain: at 0.85
+// with 3.1x amplification, an ordinary fast sweep looks like a glitch and was
+// being discarded, which froze the cursor mid-sweep.
+const MAX_JUMP = 0.95;
+/**
+ * Below this distance from the learned centre, the hand counts as still.
+ *
+ * Scaled down with the gain rise: 0.014 was 4% of the screen once amplified,
+ * which read as a sticky spot in the middle of the display.
+ */
+const DEAD_ZONE = 0.009;
 /**
  * How long the cursor stays on screen after the last frame that placed it.
  *
@@ -129,6 +144,19 @@ const DEAD_ZONE = 0.014;
  * is hidden once the hand has really gone, not on the first frame it is missing.
  */
 const POINTER_HOLD_MS = 260;
+/**
+ * How far a closed hand must travel sideways to page a window.
+ *
+ * Normalised camera units, and measured from where the fist was formed, so it
+ * does not depend on where in the frame the hand happens to be. 0.12 is a
+ * deliberate sweep about a quarter of the frame wide; smaller values turned an
+ * ordinary fist forming into a page turn.
+ */
+const SWIPE_DISTANCE = 0.12;
+/** A fist that drifts vertically more than this is not sliding sideways. */
+const SWIPE_MAX_DRIFT = 0.10;
+/** One page per deliberate sweep, not one per frame of it. */
+const SWIPE_COOLDOWN_MS = 400;
 
 type Normalized = { x: number; y: number; z: number };
 
@@ -162,6 +190,14 @@ export interface TabletTrackingOptions {
    * is the only report of the second half of it.
    */
   onFist?: (fist: boolean) => void;
+  /**
+   * A closed hand swept horizontally, on this screen.
+   *
+   * The other half of the "slide to the next screen" gesture. On the laptop it
+   * switches virtual desktops; here it pages through the windows that have been
+   * sent to this iPad.
+   */
+  onSwipe?: (direction: 'left' | 'right') => void;
 }
 
 export interface TabletTracking {
@@ -225,6 +261,37 @@ function fingerCurl(hand: Normalized[]): number {
   if (curls.length === 0) return 0;
   const mean = curls.reduce((sum, value) => sum + value, 0) / curls.length;
   return Math.min(1, Math.max(0, mean));
+}
+
+/**
+ * Which landmark set belongs to the hand the user means.
+ *
+ * Reported: "the cursor should be controlled by right hand only... left should
+ * only be for window switching." MediaPipe labels each hand it finds, so the
+ * pointer can follow the right hand alone - but the label is per frame and drops
+ * for a moment when the hand is half out of shot, so the chosen index is sticky:
+ * a frame without a label keeps the hand the previous frame chose instead of
+ * handing the cursor to whichever hand happens to still be detected.
+ */
+function chooseHand(
+  labels: string[],
+  count: number,
+  sticky: number,
+  want: 'Left' | 'Right',
+  exclude = -1,
+): number | null {
+  const matches = (index: number): boolean => labels[index] === want;
+  if (sticky >= 0 && sticky < count && sticky !== exclude && matches(sticky)) return sticky;
+  for (let index = 0; index < count; index += 1) {
+    if (index !== exclude && matches(index)) return index;
+  }
+  // No label at all (an older Safari, or a build without handedness output):
+  // fall back to position rather than refusing to track anything. The first
+  // unclaimed hand is the pointer, as it was before hands had separate jobs.
+  if (!labels.some((label) => label === 'Left' || label === 'Right')) {
+    for (let index = 0; index < count; index += 1) if (index !== exclude) return index;
+  }
+  return null;
 }
 
 /** Palm centre: rigid while the fingers pinch, unlike a fingertip. */
@@ -320,6 +387,12 @@ export function useTabletTracking(options: TabletTrackingOptions): TabletTrackin
   /** When the hand went missing while a fist was believed held. 0 = present. */
   const fistLostAtRef = useRef(0);
 
+  /** Where the current closed-hand sweep started, if one is in progress. */
+  /** Which detected hand is the right one, kept between frames. */
+  const rightIndexRef = useRef(-1);
+  /** Where the left hand started its paging sweep. */
+  const leftSwipeRef = useRef<{ x: number; y: number } | null>(null);
+  const leftSwipeAtRef = useRef(0);
   /** The cursor's current position, and when it was last placed. */
   const pointerRef = useRef<{ x: number; y: number } | null>(null);
   const pointerAtRef = useRef(0);
@@ -502,7 +575,10 @@ export function useTabletTracking(options: TabletTrackingOptions): TabletTrackin
       const hand = await HandLandmarker.createFromOptions(fileset, {
         baseOptions: { modelAssetPath: HAND_MODEL, delegate },
         runningMode: 'VIDEO',
-        numHands: 1,
+        // Two hands: the right one is the pointer, the left one pages between
+        // the windows that have been sent here. One hand was not enough once
+        // the left hand got its own job.
+        numHands: 2,
         minHandDetectionConfidence: 0.5,
         minHandPresenceConfidence: 0.5,
         minTrackingConfidence: 0.5,
@@ -604,7 +680,48 @@ export function useTabletTracking(options: TabletTrackingOptions): TabletTrackin
       /* a missed frame is normal while the camera warms up */
     }
 
-    const rawHand = handResult?.landmarks[0];
+    // The right hand is the pointer; the left hand only pages.
+    const hands = handResult?.landmarks ?? [];
+    const labels = (handResult?.handednesses ?? []).map((entry) =>
+      String(entry?.[0]?.categoryName ?? ''),
+    );
+    const rightIndex = chooseHand(labels, hands.length, rightIndexRef.current, 'Right');
+    rightIndexRef.current = rightIndex ?? -1;
+
+    // -- left hand: the paging sweep ---------------------------------------
+    //
+    // Given its own hand on purpose. Sharing one hand with the pointer meant a
+    // paging sweep also dragged the cursor across the screen, and a pinch to
+    // click could be read as the start of a page turn.
+    if (gazeRef.current.opinion === true && hands.length > 0) {
+      const leftIndex = chooseHand(labels, hands.length, -1, 'Left', rightIndex ?? -1);
+      const leftRaw = leftIndex === null ? null : hands[leftIndex];
+      const leftHand = leftRaw && leftRaw.length > 0 ? mirrored(leftRaw) : null;
+      const leftPalm = leftHand ? palmCentre(leftHand) : null;
+      const leftClosed = leftHand ? fingerCurl(leftHand) >= FIST_ENTER : false;
+      if (!leftPalm || !leftClosed) {
+        leftSwipeRef.current = null;
+      } else if (!leftSwipeRef.current) {
+        leftSwipeRef.current = { x: leftPalm.x, y: leftPalm.y };
+      } else {
+        const dx = leftPalm.x - leftSwipeRef.current.x;
+        const dy = leftPalm.y - leftSwipeRef.current.y;
+        if (Math.abs(dy) > SWIPE_MAX_DRIFT) {
+          leftSwipeRef.current = { x: leftPalm.x, y: leftPalm.y };
+        } else if (
+          Math.abs(dx) >= SWIPE_DISTANCE &&
+          now - leftSwipeAtRef.current >= SWIPE_COOLDOWN_MS
+        ) {
+          leftSwipeAtRef.current = now;
+          leftSwipeRef.current = { x: leftPalm.x, y: leftPalm.y };
+          optionsRef.current.onSwipe?.(dx > 0 ? 'right' : 'left');
+        }
+      }
+    } else {
+      leftSwipeRef.current = null;
+    }
+
+    const rawHand = rightIndex === null ? null : hands[rightIndex];
     if (!rawHand || rawHand.length === 0) {
       // A missing hand is a moment of doubt while a pinch or a fist is in
       // flight, and an ending only after that grace has passed.
@@ -660,6 +777,9 @@ export function useTabletTracking(options: TabletTrackingOptions): TabletTrackin
     // half of the window-carry gesture. The pointer keeps following the palm in
     // the same frame, so opening the hand does not lose the cursor.
     reportFist(isFist);
+
+    // The right hand is a fist only when the right hand is a fist; paging moved
+    // to the left hand above, so nothing here turns a page.
 
     // Learn the neutral point from the first stationary frames. Without it the
     // cursor would start wherever the arm happens to rest, usually a corner.

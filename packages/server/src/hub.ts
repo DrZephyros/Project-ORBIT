@@ -204,10 +204,23 @@ export class OrbitHub {
       case 'desktop.transcript':
       case 'desktop.voice.state':
       case 'desktop.device.revoke':
+      case 'desktop.pairing.request':
       case 'desktop.ping': {
         if (client.role !== 'desktop') return this.sendError(client, 'unauthorised', 'Desktop message from a non-desktop socket.');
         const session = client.session;
         if (!session) return this.sendError(client, 'no-session', 'Start a session first.');
+
+        if (msg.t === 'desktop.pairing.request') {
+          // Always rotate. The Setup page asks when a countdown reaches zero and
+          // when the user presses "New code", and both mean "give me a different
+          // code" - answering with the same one would look like a dead button.
+          // The page only asks once per expiry, so there is no loop to protect
+          // against by refusing here.
+          session.issuePairing();
+          const offer = session.pairingOffer();
+          if (offer) this.send(client, { t: 'server.pairing', pairing: offer });
+          return;
+        }
 
         if (msg.t === 'desktop.device.revoke') {
           const revoked = session.revoke(msg.receiverId);
@@ -264,7 +277,9 @@ export class OrbitHub {
       case 'receiver.ice':
       case 'receiver.approval':
       case 'receiver.fist':
-      case 'receiver.gaze': {
+      case 'receiver.gaze':
+      case 'receiver.remote.pointer':
+      case 'receiver.remote.key': {
         if (client.role !== 'receiver') return this.sendError(client, 'unauthorised', 'Receiver message from a non-receiver socket.');
         const session = client.session;
         if (!session) return this.sendError(client, 'no-session', 'Not paired.');
@@ -440,6 +455,7 @@ const KNOWN_TYPES = new Set<string>([
   'desktop.transcript',
   'desktop.voice.state',
   'desktop.device.revoke',
+  'desktop.pairing.request',
   'desktop.ping',
   'receiver.hello',
   'receiver.panel.move',
@@ -455,6 +471,8 @@ const KNOWN_TYPES = new Set<string>([
   'receiver.ping',
   'receiver.gaze',
   'receiver.fist',
+  'receiver.remote.pointer',
+  'receiver.remote.key',
 ]);
 
 function isClientMessage(value: unknown): value is ClientMessage {
@@ -506,6 +524,35 @@ function relayToDesktop(msg: ClientMessage): DesktopRelayMessage | null {
         fist: msg.fist === true,
         at: Number.isFinite(msg.at) ? msg.at : Date.now(),
       };
+    case 'receiver.remote.pointer': {
+      const x = Number(msg.x);
+      const y = Number(msg.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      const kind = msg.kind === 'down' ? 'down' : msg.kind === 'up' ? 'up' : 'move';
+      return {
+        t: 'server.remote.pointer',
+        panelId: String(msg.panelId ?? ''),
+        // Clamped here rather than at the desktop: a tracker that reports a hand
+        // slightly outside the frame must not be able to click outside the
+        // window it is meant to be controlling.
+        x: Math.min(1, Math.max(0, x)),
+        y: Math.min(1, Math.max(0, y)),
+        kind,
+        at: Number.isFinite(msg.at) ? msg.at : Date.now(),
+      };
+    }
+    case 'receiver.remote.key': {
+      const text = typeof msg.text === 'string' ? msg.text.slice(0, 512) : undefined;
+      const key = typeof msg.key === 'string' ? msg.key : undefined;
+      if (!text && !key) return null;
+      return {
+        t: 'server.remote.key',
+        panelId: String(msg.panelId ?? ''),
+        ...(text ? { text } : {}),
+        ...(key ? { key: key as never } : {}),
+        at: Number.isFinite(msg.at) ? msg.at : Date.now(),
+      };
+    }
     default:
       return null;
   }

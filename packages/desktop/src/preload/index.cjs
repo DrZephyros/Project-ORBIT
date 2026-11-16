@@ -12,6 +12,7 @@ const invoke = {
   setPrefs: (patch) => ipcRenderer.invoke('orbit:set-prefs', patch),
   requestSources: (options) => ipcRenderer.invoke('orbit:request-sources', options),
   grantCapture: (sourceId) => ipcRenderer.invoke('orbit:grant-capture', sourceId),
+  registerCastPanel: (panelId, hwnd) => ipcRenderer.invoke('orbit:register-cast-panel', panelId, hwnd),
   startSession: (catalog) => ipcRenderer.invoke('orbit:start-session', catalog),
   stopSession: () => ipcRenderer.invoke('orbit:stop-session'),
   setActiveSource: (sourceId) => ipcRenderer.invoke('orbit:set-active-source', sourceId),
@@ -21,6 +22,7 @@ const invoke = {
   streamStop: (panelId) => ipcRenderer.invoke('orbit:stream-stop', panelId),
   pushPointer: (pointer, phase) => ipcRenderer.invoke('orbit:push-pointer', pointer, phase),
   revoke: (receiverId) => ipcRenderer.invoke('orbit:revoke', receiverId),
+  newPairingCode: () => ipcRenderer.invoke('orbit:new-pairing-code'),
   pushTask: (task) => ipcRenderer.invoke('orbit:push-task', task),
   pushApproval: (approval) => ipcRenderer.invoke('orbit:push-approval', approval),
   pushTranscript: (transcript) => ipcRenderer.invoke('orbit:push-transcript', transcript),
@@ -57,6 +59,9 @@ const EVENTS = [
   'orbit:ev-error',
   'orbit:ev-gesture-status',
   'orbit:ev-gesture-event',
+  'orbit:ev-grab-target',
+  'orbit:register-cast-panel',
+  'orbit:ev-cycle-panel',
   'orbit:ev-gesture-state',
 ];
 

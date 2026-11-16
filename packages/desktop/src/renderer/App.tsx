@@ -64,6 +64,16 @@ export function App() {
   const heldPanel = useRef<string | null>(null);
   /** The panel just released, kept for the `window.handoff` that can follow. */
   const lastReleasedPanel = useRef<string | null>(null);
+  /**
+   * When the current fist grab started, or 0.
+   *
+   * The grab and the capture-source resolution are two events: the helper only
+   * knows the window handle a few milliseconds after the gesture. This lets a
+   * source that arrives long after the fact be recognised as stale.
+   */
+  const grabStartedAt = useRef(0);
+  /** The window handle the current carry picked up, for the hand-off mapping. */
+  const grabbedHwnd = useRef<string | null>(null);
   /** Title of the window being carried toward the iPad, for its preview card. */
   const [previewTitle, setPreviewTitle] = useState<string | null>(null);
   /** Latest decoded gaze target, mirrored for the pinch-click handler. */
@@ -136,85 +146,21 @@ export function App() {
       // A fist held up in front grabs the active window. Nothing is sent to the
       // iPad yet: the destination is only decided when the hand opens, and the
       // service attaches that decision to `window.release` as `detail.gaze`.
+      //
+      // Which *window* that is comes from the main process, not from here.
+      //
+      // Reported: "it was a small black window with the title status." This branch
+      // used to take `sources[0]` from its own enumeration on the theory that
+      // desktopCapturer lists windows frontmost-first - and a hidden helper window
+      // with a black surface sits at the front of that list, so the panel streamed
+      // a window that has no pixels. Only the main process knows the HWND the
+      // PowerShell helper actually grabbed, and a capture source id is
+      // `window:<hwnd>:0`, so it names the source and sends it as `grabTarget`.
       on('orbit:ev-gesture-event', (event) => {
         if (event.kind === 'window.grab') {
-          const current = stateRef.current;
-
-          const startGrab = (sources: WindowSource[]): void => {
-            // Grab the window the user is actually looking at.
-            //
-            // `activeSourceId` remembers the last window chosen on the Setup
-            // page, which has nothing to do with which window is in front now.
-            // Grabbing it meant the hand could close over one window and pick up
-            // a completely different one - which is how a small hidden window
-            // ended up on the iPad as a black rectangle.
-            //
-            // Sources are ordered most-recently-active first by the OS, so the
-            // first entry after filtering is the foreground window.
-            // `desktopCapturer` returns windows in Z-order, frontmost first, so
-            // the first entry is the window the user has in front of them.
-            const sourceId = sources[0]?.id ?? null;
-            const source = sources.find((x) => x.id === sourceId);
-            if (!sourceId || !source) {
-              setState((s) => ({
-                ...s,
-                error: {
-                  code: 'gaze',
-                  message: 'No capturable window found. Open the window you want, then raise your fist again.',
-                  at: Date.now(),
-                },
-              }));
-              return;
-            }
-
-            void ensureSession(sourceId);
-
-            const existing = current.workspace.panels.find((p) => p.sourceId === sourceId);
-            if (existing) {
-              heldPanel.current = existing.id;
-              setState((s) => ({ ...s, workspace: selectPanel(s.workspace, existing.id) }));
-              return;
-            }
-
-            const { state: next, panel } = addPanel(current.workspace, {
-              sourceId,
-              title: source.name,
-              kind: 'live',
-            });
-            // A grabbed panel starts laptop-owned (no ownerDeviceId), which is
-            // what the receiver uses to hide it.
-            heldPanel.current = panel.id;
-            setState((s) => ({ ...s, workspace: next }));
-          };
-
-          if (current.sources.length) {
-            startGrab(current.sources);
-            return;
-          }
-
-          // The source list is normally filled by Setup/Workspace, but a grab
-          // must work from the Gestures page too. Enumerating on demand is the
-          // difference between "the fist does nothing" and actually grabbing.
-          void api()
-            .requestSources({ thumbnails: false })
-            .then((list: WindowSource[]) => {
-              setState((s) => ({
-                ...s,
-                sources: list,
-                activeSourceId: s.activeSourceId ?? list[0]?.id ?? null,
-              }));
-              startGrab(list);
-            })
-            .catch(() => {
-              setState((s) => ({
-                ...s,
-                error: {
-                  code: 'gaze',
-                  message: 'Could not list windows to grab.',
-                  at: Date.now(),
-                },
-              }));
-            });
+          // Start of a carry. The panel is created when `orbit:ev-grab-target`
+          // arrives, a few milliseconds later.
+          grabStartedAt.current = Date.now();
           return;
         }
 
@@ -226,9 +172,19 @@ export function App() {
           heldPanel.current = null;
           lastReleasedPanel.current = null;
           const current = stateRef.current;
-          const panel = panelId
-            ? current.workspace.panels.find((p) => p.id === panelId)
-            : current.workspace.panels.find((p) => p.selected);
+          // The hand-off names the window it means, by handle. Prefer that over
+          // any remembered id: the ids are bookkeeping here, while the handle is
+          // the window the hand actually picked up.
+          const handedHwnd =
+            typeof event.detail?.hwnd === 'string' ? event.detail.hwnd : null;
+          const byHandle = handedHwnd
+            ? current.workspace.panels.find((p) => p.sourceId.startsWith(`window:${handedHwnd}:`))
+            : undefined;
+          const panel =
+            byHandle ??
+            (panelId
+              ? current.workspace.panels.find((p) => p.id === panelId)
+              : current.workspace.panels.find((p) => p.selected));
           if (!panel) return;
 
           const destination = current.session?.receivers[0];
@@ -249,6 +205,13 @@ export function App() {
             workspace: assignPanelDevice(s.workspace, panel.id, destination.id),
             error: null,
           }));
+          // Tell the main process which window this panel is showing, so the
+          // iPad's cursor, button and keyboard can reach the real application
+          // instead of a drawing of one. The event names the handle the fist
+          // picked up, which is the only handle we can trust here.
+          void api()
+            .registerCastPanel(panel.id, handedHwnd ?? grabbedHwnd.current)
+            .catch(() => undefined);
           void sendersRef.current.start(panel.id, panel.sourceId).catch((error) => {
             // Capture failed: put the panel back on the laptop rather than
             // leaving an iPad row that will never receive video.
@@ -478,6 +441,80 @@ export function App() {
           return;
         }
       }),
+      // The window handle that was grabbed, resolved to a capture source.
+      //
+      // This is the only place a grabbed panel is created: the source is started
+      // from here, so a stale resolution (the hand already let go) cannot create a
+      // panel that was already released.
+      on('orbit:ev-grab-target', (target) => {
+        const startedAt = grabStartedAt.current;
+        grabStartedAt.current = 0;
+        // Remembered for the hand-off: the panel has to point at this exact
+        // window on the laptop, not at whatever happens to be in front later.
+        grabbedHwnd.current = target.hwnd;
+        if (target.sourceId === null) {
+          setState((s) => ({
+            ...s,
+            error: {
+              code: 'capture-failed',
+              message:
+                'That window has no picture to capture. Bring the window you want in front, then raise your fist again.',
+              at: Date.now(),
+            },
+          }));
+          return;
+        }
+        if (startedAt !== 0 && Date.now() - startedAt > 5000) {
+          // A reply for a grab the user abandoned minutes ago; ignore it rather
+          // than dropping a window onto the workspace out of nowhere.
+          return;
+        }
+
+        // Only a resolution that belongs to a fist still held is a carry. If the
+        // hand opened before the source came back, the window is still added (the
+        // user meant to pick it up) but nothing is marked as held, so a later
+        // release cannot send a window the user is no longer holding.
+        const stillHeld = startedAt !== 0;
+
+        const current = stateRef.current;
+        void ensureSession(target.sourceId);
+        const existing = current.workspace.panels.find((p) => p.sourceId === target.sourceId);
+        if (existing) {
+          if (stillHeld) heldPanel.current = existing.id;
+          setState((s) => ({ ...s, error: null, workspace: selectPanel(s.workspace, existing.id) }));
+          return;
+        }
+        const { state: next, panel } = addPanel(current.workspace, {
+          sourceId: target.sourceId,
+          title: target.title || 'Window',
+          kind: 'live',
+        });
+        // A fresh panel starts laptop-owned (no ownerDeviceId), which is what the
+        // receiver uses to keep it off the iPad until it is sent.
+        if (stillHeld) heldPanel.current = panel.id;
+        else lastReleasedPanel.current = panel.id;
+        setState((s) => ({ ...s, error: null, workspace: next }));
+      }),
+
+      // A left-fist swipe while looking at the iPad pages through the windows
+      // that are already on it. The main process decides which meaning the swipe
+      // has (desktops on the laptop, windows on the iPad) and tells us here.
+      on('orbit:ev-cycle-panel', (direction) => {
+        const current = stateRef.current;
+        // Only windows that live on a receiver: the laptop's own panels are not
+        // on the iPad, so paging through them would look like nothing happened.
+        const onTablet = current.workspace.panels.filter((p) => p.ownerDeviceId);
+        if (onTablet.length === 0) return;
+        const index = onTablet.findIndex((p) => p.selected);
+        const step = direction === 'left' ? -1 : 1;
+        // Wrap around: a swipe past the last window goes back to the first, so
+        // the gesture never dead-ends.
+        const nextIndex = index === -1 ? 0 : (index + step + onTablet.length) % onTablet.length;
+        const next = onTablet[nextIndex];
+        if (!next) return;
+        setState((s) => ({ ...s, workspace: selectPanel(s.workspace, next.id) }));
+      }),
+
       // Relay the hand cursor to the receiver only while the head is turned to
       // the iPad. Looking at the laptop hides it, which is also what makes
       // "hands control the screen you are looking at" true on the receiver side.

@@ -283,6 +283,101 @@ button {
     radial-gradient(circle at 50% 0%, #121722 0%, #08090c 62%);
 }
 
+/* A window sent to the iPad is the screen.
+   Reported: "make the windows appear in full screen." The workspace bar and
+   footer were still taking ~90 px of a 768 px tall screen, and on a device held
+   in the hand that is a visible border of app around the thing being looked at.
+   Both are hidden and the two controls that have to stay reachable - which
+   window this is, and how to send it back - float over the window instead. */
+.ws-solo .ws-bar,
+.ws-solo .ws-foot {
+  display: none;
+}
+
+.ws-solo .canvas {
+  background: #000;
+}
+
+.canvas-solo {
+  position: absolute;
+  inset: 0;
+}
+
+.solo-chrome {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: calc(6px + var(--safe-t)) calc(10px + var(--safe-r)) 10px calc(10px + var(--safe-l));
+  /* A fade, not a bar: the window's own top edge stays visible under it. */
+  background: linear-gradient(to bottom, rgba(6, 8, 12, 0.82), rgba(6, 8, 12, 0));
+  opacity: 0.45;
+  transition: opacity 160ms ease;
+}
+
+.solo-chrome:hover,
+.solo-chrome:focus-within {
+  opacity: 1;
+}
+
+.solo-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 45vw;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+.solo-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.solo-dots .dot {
+  width: 7px;
+  height: 7px;
+  padding: 0;
+  border-radius: 50%;
+  border: 0;
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.solo-dots .dot.active {
+  background: #fff;
+  transform: scale(1.25);
+}
+
+.solo-btn {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(12, 16, 24, 0.7);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.solo-dots + .solo-btn {
+  margin-left: 0;
+}
+
+/* Full-bleed single window: no rounded card, no shadow, no inset - it *is* the
+   screen. The header stays so the window can be returned or closed. */
+.canvas-solo .panel {
+  border-radius: 0;
+  border: 0;
+  box-shadow: none;
+}
+
 .canvas-empty {
   position: absolute;
   inset: 0;
@@ -888,4 +983,53 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* -- iPad keyboard for a transferred window ------------------------------ */
+
+/* A transferred window is a real window on the laptop, so the iPad's keyboard
+   has no local field to type into. This button raises the on-screen keyboard and
+   points it at whatever the laptop is showing. */
+.remote-keyboard-toggle {
+  position: fixed;
+  z-index: 910;
+  /* Bottom left, clear of the solo chrome strip along the top and of the
+     tracking chip in the top right. */
+  left: calc(14px + var(--safe-l));
+  bottom: calc(16px + var(--safe-b));
+  padding: 10px 16px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.16));
+  border-radius: 999px;
+  background: rgba(18, 18, 22, 0.72);
+  color: var(--fg, #f5f5f7);
+  font: inherit;
+  font-size: 14px;
+  /* The hand cursor is the pointer here; a visible iOS tap highlight on top of
+     it just adds noise. */
+  -webkit-tap-highlight-color: transparent;
+  backdrop-filter: blur(12px);
+}
+
+.remote-keyboard-toggle.is-open {
+  background: var(--accent);
+  color: #101014;
+}
+
+/* Focusable but invisible, and NOT `display: none`: iOS will not raise the
+   keyboard for a hidden field, and a field that cannot be focused cannot be
+   typed into. It is moved off-screen instead, with the cursor parked at 0. */
+.remote-keyboard-field {
+  position: fixed;
+  z-index: -1;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  /* iOS zooms the page in when a field smaller than 16px is focused; 16px keeps
+     the layout still. */
+  font-size: 16px;
+  pointer-events: none;
 }

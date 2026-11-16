@@ -7,6 +7,7 @@ import { Settings } from './settings.js';
 import { GestureBridge } from './gestures.js';
 import { SystemPointer } from './system-pointer.js';
 import { initLogging, log, logFile, startFreezeWatchdog } from './log.js';
+import { carryIndicator } from './carry-indicator.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -80,6 +81,11 @@ function createWindow(): void {
 
   mainWindow.on('closed', () => {
     log.info('window', 'Window closed.');
+    // The carry overlay is a second visible window, and `window-all-closed` only
+    // fires once every window is gone. Destroying it first keeps "close ORBIT" a
+    // single action instead of leaving a ghost ring on the desktop and a process
+    // that will not exit.
+    carryIndicator().destroy();
     mainWindow = null;
   });
 
@@ -195,7 +201,7 @@ app.whenReady().then(() => {
   createWindow();
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (!mainWindow) createWindow();
   });
 });
 
@@ -210,6 +216,7 @@ app.on('window-all-closed', () => {
 // The Python service is a child process; never leave the camera running.
 app.on('before-quit', () => {
   log.info('app', 'Quitting.');
+  carryIndicator().destroy();
   client?.dispose();
   gestures?.stop();
   systemPointer?.dispose();

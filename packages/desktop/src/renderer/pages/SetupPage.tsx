@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { SharedProps } from '../App.js';
 import { api } from '../env.js';
 
@@ -14,6 +14,14 @@ export function SetupPage({ state }: SharedProps) {
   const [countdown, setCountdown] = useState(0);
   const [qr, setQr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  /**
+   * The `expiresAt` we have already auto-refreshed, so one dead code is fetched
+   * once. Without this the countdown re-renders every second and fires a request
+   * per tick.
+   */
+  const refreshedFor = useRef<number | null>(null);
 
   useEffect(() => {
     if (!state.pairing) {
@@ -51,6 +59,40 @@ export function SetupPage({ state }: SharedProps) {
 
   const connected = (state.session?.receivers.length ?? 0) > 0;
   const certUrl = pairingCertUrl(state.pairing?.url);
+  // Derived from the clock, not from `countdown`, which starts at 0 for one
+  // render before the first tick and would look like an expired code on mount.
+  const expired = state.pairing !== null && state.pairing.expiresAt <= Date.now();
+
+  /**
+   * Ask the server for a replacement code.
+   *
+   * Reported: "when a code expires there is no way to get a new one." A code is
+   * valid for five minutes and is single use, and the server only ever pushed
+   * codes on its own initiative - so once the countdown reached 0:00 the page sat
+   * there for good and the only way to pair was to restart the app.
+   */
+  const requestNewCode = useCallback(async (): Promise<void> => {
+    setBusy(true);
+    try {
+      const result = await api().newPairingCode();
+      setNote(result.ok ? null : result.message);
+    } catch {
+      setNote('Could not reach the local server. Is ORBIT still running?');
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  // Fetch a replacement the moment the code runs out, so the page is never a
+  // dead end. The button below does the same thing on demand, which also covers
+  // the case where the user has the QR open on the iPad and wants a new one
+  // before it expires.
+  useEffect(() => {
+    if (!expired || !state.pairing) return;
+    if (refreshedFor.current === state.pairing.expiresAt) return;
+    refreshedFor.current = state.pairing.expiresAt;
+    void requestNewCode();
+  }, [expired, state.pairing, requestNewCode]);
 
   return (
     <>
@@ -73,7 +115,6 @@ export function SetupPage({ state }: SharedProps) {
           Pairing code
           <span className="sub">{connected ? 'A receiver is connected' : 'Waiting for a receiver'}</span>
         </h2>
-
         <div className="pair-grid">
           <div className="qr" aria-label="Pairing QR code">
             {qr ? (
@@ -88,9 +129,11 @@ export function SetupPage({ state }: SharedProps) {
               {state.pairing?.code ?? '——————'}
             </div>
             <div className="code-meta">
-              {state.pairing
-                ? `Expires in ${Math.floor(countdown / 60)}:${String(countdown % 60).padStart(2, '0')} · changes after each pairing`
-                : 'Waiting for the local server to offer a code.'}
+              {!state.pairing
+                ? 'Waiting for the local server to offer a code.'
+                : expired
+                  ? 'This code has expired. A new one is being issued — or press “New code”.'
+                  : `Expires in ${Math.floor(countdown / 60)}:${String(countdown % 60).padStart(2, '0')} · changes after each pairing`}
             </div>
 
             <div className="url-row" style={{ marginTop: 14 }}>
@@ -114,7 +157,21 @@ export function SetupPage({ state }: SharedProps) {
               >
                 Open
               </button>
+              <button
+                className="btn btn-sm btn-ghost"
+                onClick={() => void requestNewCode()}
+                disabled={busy}
+                title="Replace this code with a fresh five minute one"
+              >
+                {busy ? 'Issuing…' : 'New code'}
+              </button>
             </div>
+
+            {note && (
+              <p className="note" style={{ marginTop: 10 }}>
+                {note}
+              </p>
+            )}
 
             <ol className="steps" style={{ marginTop: 18 }}>
               <li className="done">ORBIT is running on this laptop.</li>

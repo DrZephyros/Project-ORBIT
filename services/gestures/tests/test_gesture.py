@@ -38,6 +38,7 @@ from orbit_gestures.geometry import (  # noqa: E402
     detect_fist,
     detect_mouth_contact,
     detect_pointer,
+    left_fist_closed,
     palm_normal,
     pick_hand_index,
     pinch_distance,
@@ -2525,6 +2526,99 @@ def test_gaze_release_needs_a_usable_calibration() -> None:
     router.observe(0, 12.0)
     router.observe(1000, 12.0)
     check("a calibration too narrow never routes", router.release_target() is None)
+
+
+def test_a_held_grab_survives_the_hand_sweeping_out_wide() -> None:
+    """Bug: dragging a window stopped part-way across the screen.
+
+    Reported: "Moving of windows with the right fist is not reliable as it works
+    but it is not continuous." A drag sweeps the hand across the body, and the
+    distance from the mouth grows as it goes. Past `max_front_distance` the fist
+    stopped counting as "in front", the grab was released after its grace, and
+    the window stopped following - so the user had to raise the fist again for
+    each half of the screen.
+
+    Held, the far edge of the pickup band is not information: the only release
+    worth making is the hand opening or returning to the mouth.
+    """
+    # A face 0.12 wide is somebody sitting at a desk, not leaning in, and it is
+    # what makes the arithmetic here real: at the fixture's default width the
+    # frame corners are only about 3.8 face widths from the mouth, so a hand
+    # cannot get far enough away to leave the band in the first place.
+    face = make_face(width=0.12)
+    # Well past the pickup band's far edge, but clearly not at the mouth.
+    hand = make_fist(Point(0.95, 0.9))
+    loose = detect_fist(hand, face, world_hand=None)
+    held = detect_fist(hand, face, world_hand=None, held=True)
+    check(
+        "a wide hand does not start a grab",
+        not loose.in_front,
+        loose.reason,
+    )
+    check("but a grab already held keeps it", held.in_front, held.reason)
+
+    # The real check: the window keeps moving across a whole drag.
+    machine = MouthGestureMachine()
+    machine.arm(0)
+    events: list = []
+    for t in range(0, 600, 33):
+        events += feed(machine, t, in_front=True, distance=1.8, curl=0.9, pointer=(0.4, 0.5))
+        if t >= 400:
+            # Swept far out to the side: the band the pickup needed is gone, but
+            # `held` keeps `in_front` true.
+            events += feed(
+                machine, t + 10, in_front=True, distance=4.6, curl=0.9, pointer=(0.6, 0.5)
+            )
+    check(
+        "the window was grabbed",
+        any(e.kind == "window.grab" for e in events),
+        str([e.kind for e in events]),
+    )
+    check(
+        "and no release fired while the hand swept wide",
+        not [e for e in events if e.kind == "window.release"],
+        str([e.kind for e in events]),
+    )
+
+
+def test_the_left_hand_is_recognised_away_from_the_mouth_band() -> None:
+    """Bug: the desktop swipe never fired at all.
+
+    Reported: "Changing between desktops when I am looking at the laptop (It
+    currently does not work)." There was no `Desktop switch` line in the log, so
+    the gesture itself never reached the desktop app.
+
+    The left hand was classified with the *right* hand's grab detector, which
+    only calls a hand "in front" between 1.15 and 3.5 face widths from the
+    mouth. A left hand held out to the side - where a swipe begins - sits far
+    outside that band, so `left_fist` was never true and the machine was never
+    fed the gesture.
+    """
+    face = make_face(width=0.12)
+    # A closed left hand, held out to the side and away from the mouth.
+    closed = make_anatomical_hand(Point(0.06, 0.92), curled=True)
+    reading = detect_fist(closed, face)
+    check("the grab band rejects a hand held out wide", not reading.in_front, reading.reason)
+    check("but the swipe recognises it", left_fist_closed(closed), "closed hand not recognised")
+
+    # An open hand must still do nothing. `make_anatomical_hand` builds real
+    # finger proportions, so "open" here really is open rather than a fixture
+    # whose knuckles are missing.
+    open_hand = make_anatomical_hand(Point(0.06, 0.92), curled=False)
+    check("an open left hand is not a swipe", not left_fist_closed(open_hand))
+    check("and a missing hand is not a swipe", not left_fist_closed(None))
+
+
+def test_a_left_fist_held_out_wide_still_walks_desktops() -> None:
+    """The whole path, with the hand where a swipe actually starts."""
+    machine = MouthGestureMachine()
+    machine.arm(0)
+    events: list = []
+    for t, x in [(0, 0.20), (40, 0.31), (80, 0.44)]:
+        events += feed(machine, t, in_front=False, hand=False, face=False,
+                       left_fist=True, left_pointer=(x, 0.55))
+    switched = [e.detail["direction"] for e in events if e.kind == "desktop.switch"]
+    check("a closed left hand out wide switches desktops", bool(switched), str(switched))
 
 
 def main() -> int:

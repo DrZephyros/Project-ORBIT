@@ -269,6 +269,37 @@ try {
     assert.equal(stopped.t, 'server.stop');
   });
 
+  await test('the iPad pointing at a transferred window reaches the desktop', async () => {
+    // The cursor, the button and the keyboard for a window sent to the iPad all
+    // travel this way: a small typed message, never a frame. The server only
+    // relays, but a typo in a message name would silently do nothing at all, so
+    // the whole path is asserted here.
+    receiver.send({ t: 'receiver.remote.pointer', panelId: 'p9', x: 0.5, y: 0.25, kind: 'move', at: 1 });
+    const moved = await desktop.until((m) => m.t === 'server.remote.pointer');
+    assert.equal(moved.panelId, 'p9');
+    assert.equal(moved.kind, 'move');
+    assert.equal(moved.x, 0.5);
+    assert.equal(moved.y, 0.25);
+
+    receiver.send({ t: 'receiver.remote.key', panelId: 'p9', text: 'hi', at: 2 });
+    const typed = await desktop.until((m) => m.t === 'server.remote.key');
+    assert.equal(typed.text, 'hi');
+    assert.equal(typed.key, undefined);
+
+    receiver.send({ t: 'receiver.remote.key', panelId: 'p9', key: 'Enter', at: 3 });
+    const keyed = await desktop.until((m) => m.t === 'server.remote.key' && m.key === 'Enter');
+    assert.equal(keyed.panelId, 'p9');
+  });
+
+  await test('a position outside the window is clamped, not dropped', async () => {
+    // A tracker that reports a hand slightly off the edge of the frame must not
+    // be able to click outside the window it is meant to be controlling.
+    receiver.send({ t: 'receiver.remote.pointer', panelId: 'p9', x: -3, y: 40, kind: 'down', at: 4 });
+    const down = await desktop.until((m) => m.t === 'server.remote.pointer' && m.kind === 'down');
+    assert.equal(down.x, 0);
+    assert.equal(down.y, 1);
+  });
+
   await test('malformed and unknown messages do not kill the connection', async () => {
     receiver.ws.send('{not json');
     const err = await receiver.until((m) => m.t === 'server.error');
@@ -317,6 +348,36 @@ try {
     assert.equal(welcome.pairing.code, currentCode, 'the live QR code must not be rotated away');
     assert.equal(welcome.session.receivers.length, 1, 'the paired iPad stays attached');
     desktop = reconnected;
+  });
+
+  await test('the desktop can ask for a replacement code when one expires', async () => {
+    // Reported: "when a code expires there is no way to get a new one." A code
+    // lives five minutes and is single use, and the server only ever pushed one
+    // on its own initiative, so the Setup page counted down to 0:00 and stopped
+    // there. This is the request the new "New code" button sends.
+    const expired = currentCode;
+    desktop.send({ t: 'desktop.pairing.request' });
+    const pairing = await desktop.until((m) => m.t === 'server.pairing');
+    const fresh = pairing.pairing.code;
+    assert.match(fresh, /^\d{6}$/, 'replacement is a six digit code');
+    assert.notEqual(fresh, expired, 'the replacement must differ from the dead one');
+    assert.ok(pairing.pairing.expiresAt > Date.now(), 'the replacement must still be live');
+    assert.match(pairing.pairing.qrPayload, new RegExp(`#c=${fresh}$`), 'the QR carries the new code');
+
+    // And the old code is genuinely dead, so a stale QR fails rather than
+    // silently pairing with the wrong session.
+    const stale = new Client(`ws://${BASE}/ws`);
+    await stale.open;
+    stale.send({
+      t: 'receiver.hello',
+      device: { id: 'r-stale', role: 'receiver', name: 'Old QR', kind: 'ipad' },
+      code: expired,
+    });
+    const rejected = await stale.until((m) => m.t === 'server.error' || m.t === 'server.welcome');
+    assert.equal(rejected.t, 'server.error', 'the expired code must not pair');
+    stale.close();
+
+    currentCode = fresh;
   });
 
   await test('revoking a receiver closes its socket and notifies the desktop', async () => {
