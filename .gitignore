@@ -1,0 +1,24 @@
+node_modules/
+dist/
+out/
+release/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+packages/desktop/.vite/
+packages/desktop/app-dist/
+.data/
+
+*.tsbuildinfo
+services/gestures/models/
+# Per-machine: the neutral palm pose depends on this camera and this person.
+services/gestures/calibration.json
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Agent scratch notes and tool caches - not part of the project.
+.workbuddy-ai/
+.kombai/

@@ -1,0 +1,32 @@
+{
+  "name": "orbit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ORBIT \u2014 Windows workspace broadcast to an iPad, with local gesture control",
+  "workspaces": [
+    "packages/shared",
+    "packages/server",
+    "packages/desktop",
+    "packages/receiver"
+  ],
+  "scripts": {
+    "start": "node tools/launch.mjs",
+    "start:fast": "node tools/launch.mjs --no-build",
+    "start:gestures": "node tools/launch.mjs --no-server",
+    "check": "node tools/launch.mjs --check",
+    "build:shared": "npm run build -w @orbit/shared",
+    "dev:server": "npm run dev -w @orbit/server",
+    "dev:receiver": "npm run dev -w @orbit/receiver",
+    "dev:desktop": "npm run dev -w @orbit/desktop",
+    "dev": "concurrently -n server,receiver,desktop -c cyan,magenta,green \"npm:dev:server\" \"npm:dev:receiver\" \"npm:dev:desktop\"",
+    "build": "npm run build:shared && npm run build -w @orbit/server && npm run build -w @orbit/receiver && npm run build -w @orbit/desktop",
+    "typecheck": "tsc -b packages/shared packages/server --pretty false && tsc -p packages/desktop/tsconfig.main.json --noEmit --pretty false && tsc -p packages/desktop/tsconfig.renderer.json --noEmit --pretty false && tsc -p packages/receiver/tsconfig.json --noEmit --pretty false"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

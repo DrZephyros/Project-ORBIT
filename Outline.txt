@@ -1,0 +1,580 @@
+# PROJECT ORBIT — Full Application Plan
+
+**The recommended architecture is a Windows desktop application, an iPad receiver, local gesture detection, and an AI assistant backed by free-tier APIs.** TV support comes after the iPad experience works reliably.
+
+Your decisions are now the basis of the plan:
+
+- **Windows laptop:** runs applications, captures content, executes permitted actions.
+- **iPad:** displays the workspace and provides touch controls.
+- **AI:** use good free-tier services where practical; no automatic paid fallback.
+- **Computer control:** broad supported functionality, but **no file deletion and no sensitive-information access**.
+
+**Bottom line on cost:** a useful personal prototype can operate without API charges. Unlimited, dependable, general-purpose AI computer operation cannot be promised on free tiers.
+
+---
+
+## 1. Product scope
+
+ORBIT should have three operating modes.
+
+| Mode | Purpose | Examples |
+|---|---|---|
+| **Workspace** | Broadcast and manipulate content | Show a browser window, arrange notes beside a video |
+| **Assistant** | Understand voice commands and retrieve information | Search YouTube, summarize an approved document |
+| **Operator** | Perform multi-step tasks in supported applications | Navigate a website, edit an approved test project, run permitted tests |
+
+The first two should remain useful even when the AI provider is unavailable.
+
+### Important scope boundary
+
+The iPad initially controls **ORBIT and the Windows workspace**, not arbitrary iPad applications. Safari does not give us unrestricted control over iPadOS.
+
+Similarly, ORBIT should distinguish:
+
+- **Live window:** a stream of an application running on Windows.
+- **Native ORBIT panel:** a document viewer, transcript, media player, or 3D viewer that ORBIT itself controls.
+
+A live stream does not expose document structure, video playback state, or 3D geometry automatically.
+
+---
+
+## 2. System architecture
+
+```text
+WINDOWS LAPTOP
+│
+├─ ORBIT desktop app
+│  ├─ Device pairing and session management
+│  ├─ Window selection and capture
+│  ├─ Workspace state
+│  ├─ Voice command routing
+│  └─ Activity and permission interface
+│
+├─ Local gesture service
+│  ├─ Webcam frames
+│  ├─ Hand/face landmarks
+│  └─ Gesture state machine
+│
+├─ Permission-controlled action service
+│  ├─ Supported Windows actions
+│  ├─ Browser automation
+│  ├─ Approved document access
+│  └─ Isolated coding workspace
+│
+└─ AI provider adapter
+   ├─ Speech transcription
+   ├─ Intent interpretation
+   ├─ Task planning
+   └─ Optional screenshot understanding
+                │
+       Local network connection
+                │
+IPAD RECEIVER
+├─ Live content panels
+├─ Move/resize/select controls
+├─ Dictation and task status
+├─ Approval dialogs
+└─ Touch fallback and Stop control
+```
+
+### Recommended implementation stack
+
+| Layer | Recommendation | Reason |
+|---|---|---|
+| Windows desktop shell | Electron | Practical window capture, desktop integration, consistent Chromium environment |
+| App and receiver UI | React + TypeScript | Share workspace components and state definitions |
+| Gesture recognition | MediaPipe, initially through a local Python service | Rapid experimentation with camera tracking |
+| Streaming | WebRTC | Designed for interactive audio/video |
+| Session signaling | Local authenticated WebSocket service | Pairing, stream setup, commands, and status |
+| Browser operation | Playwright in a dedicated browser profile | More dependable than clicking arbitrary screen coordinates |
+| Native Windows operation | Windows UI Automation and narrow native integrations | Structured application control where supported |
+| Local settings | SQLite or a small local configuration store | No cloud database required |
+| Credentials | Windows-protected credential storage | Keys stay on the laptop, not in the receiver |
+
+Electron is a starting recommendation, not a claim that every capture or audio feature works without native integration. Add a Windows-native helper only when testing identifies a real need.
+
+---
+
+## 3. Connection and pairing
+
+### First-run flow
+
+1. Start ORBIT on Windows.
+2. Grant camera/capture permissions as needed.
+3. Show a receiver address and QR code.
+4. Open the receiver on the iPad.
+5. Enter a short-lived pairing code.
+6. Confirm the iPad on Windows.
+7. Tap **Start session** on the iPad.
+8. Select a window to broadcast.
+
+### Required connection features
+
+- Both devices on a reachable local network.
+- Secure receiver hosting and signaling.
+- Short-lived pairing tokens.
+- Session expiry and device revocation.
+- Visible list of connected receivers.
+- Reconnect after temporary network loss.
+- No router port forwarding.
+- Firewall access limited to the intended local-network use.
+
+A QR code simplifies discovery; it does not replace authentication.
+
+**Free:** yes, using existing hardware and local networking. Trusted HTTPS setup across Windows and iPad needs an early technical test.
+
+---
+
+## 4. Broadcasting and workspace management
+
+### A. Content selection
+
+Start with:
+
+- Explicit selection of an application window.
+- A remembered broadcast target.
+- An optional “capture active window” action within an approved session.
+
+Add later:
+
+- Browser extension for tab-specific selection.
+- Approved file opening in ORBIT’s document viewer.
+- Media URL handoff.
+- ORBIT-native 3D models.
+- Entire-desktop sharing as a separate, clearly labeled mode.
+
+**Privacy default:** share a selected window, not the whole desktop.
+
+### B. Broadcast behavior
+
+Your two-handed broadcast gesture should mean:
+
+> Send the currently selected content to the paired receiver.
+
+Initially, there is only one receiver. Direction-based destination selection comes later and requires calibration.
+
+### C. Multiple windows
+
+Each panel needs:
+
+- Content identity and source.
+- Selected/unselected state.
+- Position and dimensions.
+- Minimum size and aspect-ratio rules.
+- Z-order.
+- Connection status.
+- Close-panel and return-to-laptop actions.
+
+Closing an ORBIT panel should **stop sharing that panel**, not close the source application or delete anything.
+
+### D. Two interaction modes
+
+This avoids a major gesture conflict:
+
+- **Arrange mode:** gestures move and resize panels.
+- **Interact mode:** input targets the selected application.
+
+Without that distinction, a pinch could unintentionally drag application content when the user meant to move its panel.
+
+### E. Streaming strategy
+
+Begin with one video stream. Then test two live windows.
+
+If the iPad struggles with multiple decoders, evaluate composing the workspace into one video stream on the laptop. That trades receiver simplicity for more sender-side composition work.
+
+**Free:** yes. Practical limits are laptop encoding load, Wi-Fi quality, and iPad decoding performance.
+
+---
+
+## 5. Complete gesture system
+
+Gestures should be a local input system, **not repeated requests to a cloud AI model**.
+
+### Proposed gesture vocabulary
+
+| Gesture | Action | Conditions |
+|---|---|---|
+| Deliberate open-hand hold | Arm gesture control | Visible countdown; only in an active session |
+| Pinch | Select/grab a panel | Arrange mode; target highlight first |
+| Move while pinching | Move selected panel | Clamped within display boundaries |
+| Release pinch | Place panel | Ends the drag |
+| Two-hand pinch, move apart/together | Resize selected panel | Arrange mode |
+| Spread fingers | Maximize selected panel | Requires an existing selection and deliberate hold |
+| Sideways swipe | Switch selected panel | Disabled during dragging/resizing |
+| Hands together, then push outward | Broadcast selected content | Valid paired receiver and source |
+| Pull inward | Return selected content | Stops that panel’s sharing |
+| Wrist rotation while grabbed | Rotate a 3D object | ORBIT 3D viewer only |
+| Cupped hand near mouth | Start command dictation | Gesture control armed; face and hand visible |
+| Lower hand after activation | End recording | Short grace period to avoid accidental cutoff |
+| Deliberate fist hold | Pause gesture control | Supplemental control, not the only emergency stop |
+
+These mappings are proposals to validate with real camera footage. We should not ship every gesture simply because the model can occasionally recognize it.
+
+### Gesture state machine
+
+```text
+Inactive → Armed → Target selected → Manipulating → Released
+              └→ Listening → Transcribing → Command review
+```
+
+Each recognition needs:
+
+- Confidence threshold.
+- Minimum hold duration.
+- Motion history.
+- Smoothing and a dead zone.
+- Cooldown.
+- Lost-tracking handling.
+- Clear cancellation.
+
+If tracking disappears during a drag, freeze or release safely; do not let a window jump across the screen.
+
+### Calibration
+
+- Dominant hand.
+- Comfortable movement area.
+- Camera-to-screen mapping.
+- Pinch sensitivity.
+- Gesture hold timing.
+- Left/right mirroring.
+- Sitting versus standing profile.
+
+### Camera progression
+
+1. Laptop camera first.
+2. iPad front camera experiment.
+3. Choose the better arrangement based on measured tracking quality.
+
+An iPad-camera implementation can process landmarks locally or send video to the laptop. Neither should be selected before checking performance and framing.
+
+**Free:** yes with MediaPipe. Reliability, room geometry, and fatigue remain limitations.
+
+---
+
+## 6. Dictation and voice interaction
+
+ORBIT needs **two separate voice modes**.
+
+### Command mode
+
+“Open YouTube and search for Mrwhosetheboss.”
+
+The transcript becomes an instruction for the assistant.
+
+### Text dictation mode
+
+“Write this paragraph in my notes.”
+
+The transcript becomes literal text inserted into an approved destination.
+
+**Spoken dictated text must not accidentally become an executable command.**
+
+### Recording flow
+
+1. Activate through gesture, touch, or keyboard shortcut.
+2. Show **Listening** and play a short sound.
+3. Reduce ORBIT-controlled playback volume where possible.
+4. Record one utterance.
+5. Stop on gesture, silence timeout, duration limit, or Stop.
+6. Transcribe.
+7. Show the transcript.
+8. Route to command interpretation or text entry.
+9. Request review if the meaning is uncertain.
+
+### Required safeguards
+
+- Microphone closed outside explicit recording sessions.
+- No background wake-word listener by default.
+- Cancel available throughout.
+- Temporary audio discarded after processing by default.
+- Cloud transcription clearly disclosed.
+- No promise that speech can be perfectly screened for sensitive information before upload.
+
+That last point matters: if a user speaks a secret into a cloud transcription session, the upload occurs before ORBIT knows the transcript. Local transcription is the safer option when that risk is unacceptable.
+
+### Service recommendation
+
+- **Hosted first:** Groq speech transcription, subject to account allowance.
+- **Offline fallback:** whisper.cpp, if the laptop can run it acceptably.
+- **Spoken responses:** installed local Windows voices initially.
+
+**Free:** viable for personal usage, within hosted quotas or local hardware limits.
+
+[Groq speech documentation](https://console.groq.com/docs/speech-to-text)
+
+---
+
+## 7. Assistant capabilities
+
+### Supported command groups
+
+| Group | Examples |
+|---|---|
+| Workspace | Broadcast, return, select, resize, arrange |
+| Applications | Open an approved application; switch windows |
+| Browser | Open a permitted URL, search, navigate |
+| Media | Search YouTube, choose a result, pause/resume supported playback |
+| Documents | Open and summarize an explicitly approved non-sensitive document |
+| Dictation | Insert text into the selected approved destination |
+| Coding | Inspect an isolated project, propose changes, run approved checks |
+| Session | Pause tracking, disconnect, stop current task |
+
+### Command processing
+
+```text
+Transcript
+   ↓
+Known local command?
+   ├─ Yes → validate and execute locally
+   └─ No → send minimal permitted context to AI
+                  ↓
+             Structured plan
+                  ↓
+          Permission validation
+                  ↓
+          Approval if necessary
+                  ↓
+           Execute and verify
+```
+
+Common actions should not require an LLM. That reduces latency, quota consumption, and unpredictability.
+
+Ambiguous requests should produce a choice. “Play Mrwhosetheboss” might mean the channel, latest upload, or a specific video.
+
+---
+
+## 8. AI computer operation
+
+### Execution preference
+
+Use the most structured mechanism available:
+
+1. Direct application integration.
+2. Browser DOM automation.
+3. Windows accessibility automation.
+4. Screenshot interpretation and coordinate actions as a constrained fallback.
+
+### Agent loop
+
+1. Receive a task.
+2. Identify the permitted target.
+3. Gather only necessary context.
+4. Produce a bounded plan.
+5. Validate each proposed action.
+6. Execute one action or a small safe batch.
+7. Observe the result.
+8. Continue, ask for clarification, or stop.
+
+Every task needs:
+
+- Step and time limits.
+- Visible progress.
+- Cancel.
+- Approval expiry.
+- Outcome verification.
+- Clear failed/partial/succeeded status.
+- No automatic replay of uncertain actions after a disconnect.
+
+### Your safety boundary changes the architecture
+
+**We cannot honestly guarantee “no deletion or sensitive access” while also giving an agent unrestricted mouse, keyboard, and terminal access to your logged-in desktop.**
+
+An agent could delete through an application menu, overwrite a file, or navigate into private content. Blocking a `delete_file` operation alone would not prevent that.
+
+Therefore:
+
+| Action category | Policy |
+|---|---|
+| Switch/open approved apps, arrange panels, media controls | Allowed |
+| Browse approved non-sensitive sites | Allowed within the supported environment |
+| Read explicitly approved non-sensitive documents | Allowed |
+| Edit isolated project copies | Review and approval workflow |
+| Send messages, submit forms, install software, change settings | Off by default; explicit review for any supported exception |
+| Delete files or directories | Blocked |
+| Access passwords, banking, private mail, credentials, personal documents | Blocked |
+| Unrestricted shell or arbitrary scripting on the host | Not exposed to the general agent |
+
+Additional measures:
+
+- Dedicated automation browser profile without personal logins.
+- No clipboard access by default.
+- Approved application and folder lists.
+- No full-desktop screenshot uploads by default.
+- Cloud analysis restricted to approved non-sensitive surfaces.
+- Untrusted page/repository text cannot change permissions.
+- Local Stop control independent of the AI service.
+- Stop on unexpected private content.
+
+Automated redaction helps, but **cannot guarantee that every sensitive detail is detected**. Isolation is the stronger boundary.
+
+---
+
+## 9. Coding-agent integration
+
+The coding workflow should be separate from ordinary desktop operation.
+
+### Proposed flow
+
+1. User chooses an approved non-sensitive project.
+2. ORBIT creates or uses an isolated working copy.
+3. Scan for excluded files and secrets.
+4. Agent inspects the relevant files.
+5. Show its plan.
+6. Apply proposed changes inside the isolated environment.
+7. Run approved checks.
+8. Display the diff, test output, and unresolved issues.
+9. User reviews changes before applying them to the original project.
+
+### Restrictions
+
+- No deletion of project files.
+- No automatic commits, pushes, deployments, or dependency installations.
+- No access to `.env`, private keys, credential stores, or unrelated folders.
+- No arbitrary project scripts on the host.
+
+Tests and build scripts can themselves delete files or access credentials. They must run inside an appropriately restricted disposable environment; their names alone do not make them safe.
+
+### Codex
+
+Provide a provider adapter rather than making Codex mandatory.
+
+Possible integrations include supported Codex automation interfaces or eligible user-authorized ChatGPT-plan access. Availability and permitted capabilities must be checked for the chosen integration.
+
+**Codex product access, API access, and computer-use access are different entitlements.** Some plan-based integration routes support custom actions but not native computer use.
+
+A free-tier general model can support an initial coding assistant, but we should not promise equal performance to a stronger coding agent.
+
+---
+
+## 10. Free-tier API strategy
+
+### Recommended providers
+
+| Component | Initial choice | Limitation |
+|---|---|---|
+| Gesture recognition | Local MediaPipe | No API quota; uses device compute |
+| Speech recognition | Groq free tier | Account-specific audio/request limits |
+| Intent interpretation | Tested Groq tool-capable model | Model support and quotas vary |
+| Alternative reasoning/vision | Gemini free-tier eligible model | Privacy terms and feature restrictions |
+| Optional backup | Explicitly selected OpenRouter free model/provider | Availability and provider data policies vary |
+| Text-to-speech | Installed local voices | Voice quality varies |
+| Advanced computer-use service | Optional later integration | Do not assume a free entitlement |
+
+### Important Gemini distinction
+
+Free-tier ordinary inference and function calling can help ORBIT plan actions. That is different from access to Google’s dedicated Computer Use feature, currently listed as unavailable on the free tier.
+
+Unpaid Gemini data-use terms also require care: **do not send personal, confidential, or sensitive material**. The exact terms depend on the service configuration and applicable region.
+
+### Quota handling
+
+- No cloud calls per camera frame.
+- No continuous screenshot polling.
+- Small context and selected-region observations.
+- Short voice recordings.
+- Per-task action limits.
+- Backoff on rate limits.
+- Display quota/service errors clearly.
+- Never silently enable billing.
+- Never silently send data to a second provider.
+- If AI is unavailable, keep workspace and local commands working.
+
+**“Free-tier first” is achievable. “Always available and unlimited” is not.**
+
+Official references:
+
+- [Groq limits](https://console.groq.com/docs/rate-limits) and [data handling](https://console.groq.com/docs/your-data)
+- [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing), [limits](https://ai.google.dev/gemini-api/docs/rate-limits), and [terms](https://ai.google.dev/gemini-api/terms)
+- [OpenRouter free models](https://openrouter.ai/collections/free-models/)
+- [ChatGPT-plan integration limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
+
+Model names and account allowances should be selected during setup, not hard-coded into the architecture.
+
+---
+
+## 11. Application screens
+
+### Windows desktop app
+
+1. **Setup:** device pairing, permissions, provider configuration.
+2. **Workspace:** sources, live preview, connected receiver.
+3. **Gesture settings:** calibration, mappings, sensitivity, tracking preview.
+4. **Voice settings:** input device, transcription provider, retention preferences.
+5. **Tasks:** progress, approvals, cancellation, results.
+6. **Permissions:** allowed apps, sites, folders, blocked categories.
+7. **Connections:** receivers, revoke access, session status.
+8. **Diagnostics:** latency, dropped frames, connection and provider failures.
+
+### iPad receiver
+
+1. Pairing.
+2. Start-session screen.
+3. Workspace.
+4. Panel selection and controls.
+5. Listening/transcript overlay.
+6. Task progress.
+7. Approval and result views.
+8. Disconnected/reconnect state.
+
+Touch controls remain available even after gestures work.
+
+---
+
+## 12. Build roadmap and acceptance criteria
+
+| Stage | Deliverable | Completion criteria |
+|---|---|---|
+| **0. Hardware validation** | Actual Windows/iPad connection test | Receiver opens securely; one stream plays; camera can see intended gestures |
+| **1. Core session** | Pairing, selected-window broadcast, Stop | Authenticated pairing; disconnect/revoke work; recovery is predictable |
+| **2. Workspace** | Move/resize panels with touch and mouse | Bounds, selection, aspect ratio, and reconnect state behave correctly |
+| **3. Gesture control** | Arm, pinch, move, release, broadcast/return | Measure false triggers and failures in the intended lighting and posture |
+| **4. Dictation** | Explicit recording and transcription | Correct mic lifecycle; cancel; timeout; transcript review; quota failure handling |
+| **5. Assistant** | Supported voice commands | Known commands execute reliably; ambiguity asks rather than guesses |
+| **6. Browser operator** | Multi-step tasks in isolated browser | Enforced targets; action limits; approvals; prompt-injection tests |
+| **7. Native operation** | Supported Windows application actions | Per-app capability tests; focus/privilege failures stop safely |
+| **8. Coding agent** | Isolated edits and checks | No original-project deletion; exclusions enforced; diff and results reviewed |
+| **9. Advanced content** | Document, media, 3D integrations | Semantic controls work, not just panel manipulation |
+| **10. Hardening and TV support** | Installer, updates, recovery, tested TV receiver | Compatibility documented; pairing/security re-tested on each receiver path |
+
+### Test categories throughout
+
+- Wi-Fi loss, iPad lock, browser refresh, laptop sleep.
+- Low light, tracking loss, overlapping hands, bystanders.
+- TV/video audio during dictation.
+- Rate limits and malformed AI responses.
+- Wrong-window focus and app crashes.
+- Malicious page/document instructions.
+- Attempts to reach private folders or delete through indirect actions.
+- API keys and private content appearing in logs.
+
+**For one developer, the early demonstration is a weeks-scale effort; the full supervised operator is a months-scale effort.** A credible schedule needs the hardware check and early streaming results first.
+
+---
+
+## 13. What the first release should actually contain
+
+I would aim for:
+
+- Windows application and iPad Safari receiver.
+- Secure pairing.
+- One or two live panels.
+- Touch controls.
+- A small, validated gesture vocabulary.
+- Cupped-hand command recording with a button fallback.
+- Free-tier transcription and intent interpretation.
+- Open/search/switch/media commands.
+- A restricted browser operator.
+- Visible task status and immediate cancellation.
+- Enforced no-deletion and sensitive-data boundaries.
+
+Then add native-app coverage, coding, semantic document integration, and TV support.
+
+## Final recommendation
+
+**Build ORBIT around a dependable local workspace, with AI as an optional command interpreter and supervised operator—not as the component responsible for every interaction.**
+
+That preserves your vision while keeping basic interaction fast, API usage small, and failures manageable. The biggest unresolved inputs are your hardware and what you consider sensitive; until defined, AI operation should stay inside non-sensitive test environments.
+
+I’ve saved your platform, free-tier preference, and computer-control restrictions for future work. No application code has been changed.
+
+**Would you like me to turn this into a milestone-by-milestone implementation specification, with module interfaces and a test checklist, starting with the Windows-to-iPad streaming proof?**
