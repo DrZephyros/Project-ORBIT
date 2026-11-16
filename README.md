@@ -292,3 +292,12 @@ Design decisions, bugs found and what was actually verified are recorded in
 - **Encoding cost** of two simultaneous windows has not been measured.
 - **Diagonostics page** reports what it can observe; frame drops, latency and
   quota state are marked as unmeasured rather than shown green.
+
+## License
+
+MIT — see `LICENSE`. Copyright (c) 2026 DrZephyros.
+
+The iPad app ships MediaPipe's WASM runtime and both landmarker models, and the
+project depends on Electron, React and others. Those keep their own licenses
+(Apache-2.0, MIT, BSD-3-Clause); `THIRD-PARTY.md` lists them, including which
+side of `node-forge`'s dual license ORBIT relies on.
