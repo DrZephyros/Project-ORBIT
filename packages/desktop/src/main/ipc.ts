@@ -15,6 +15,7 @@ import type { GestureBridge, PointerFrameMessage } from './gestures.js';
 import type { SystemPointer } from './system-pointer.js';
 import { log, logDirectory, logFile } from './log.js';
 import { carryIndicator } from './carry-indicator.js';
+import { gestureHud } from './gesture-hud.js';
 import { EV, IPC, type OrbitPrefs, type OrbitStatus } from '../shared/ipc.js';
 
 interface Deps {
@@ -70,6 +71,8 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
   // Last hand position, used when a click event arrives without coordinates.
   // Normalised [0,1] against the display that contains the ORBIT window.
   const lastPointer = { x: 0.5, y: 0.5, gaze: null as 'laptop' | 'tablet' | null };
+  /** When the laptop's own router last reported, so its silence is measurable. */
+  let lastPointerAt = 0;
 
   /**
    * True while the Windows left button is held down by a pinch.
@@ -213,6 +216,11 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
 
   const currentOwner = (): 'laptop' | 'tablet' => {
     if (!receiverConnected()) return 'laptop';
+    // Same ordering as `resolveGaze`: the laptop's live router decides, and the
+    // iPad is consulted only when the laptop has not said anything for a while.
+    if (lastPointerAt !== 0 && Date.now() - lastPointerAt <= 1000) {
+      return lastPointer.gaze === 'tablet' ? 'tablet' : 'laptop';
+    }
     if (tabletGazeFresh()) return tabletGaze.looking ? 'tablet' : 'laptop';
     return lastPointer.gaze === 'tablet' ? 'tablet' : 'laptop';
   };
@@ -226,19 +234,29 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
    * falls back to the last frame.
    */
   const resolveGaze = (detailGaze: unknown): 'laptop' | 'tablet' => {
-    const decided: 'laptop' | 'tablet' = tabletGazeFresh()
-      ? tabletGaze.looking
-        ? 'tablet'
-        : 'laptop'
-      : detailGaze === 'tablet'
-        ? 'tablet'
-        : detailGaze === 'laptop'
-          ? 'laptop'
-          : detailGaze === null
-            ? 'laptop'
-            : lastPointer.gaze === 'tablet'
-              ? 'tablet'
-              : 'laptop';
+    // The laptop's own router is the authority for anything that happens on the
+    // laptop. The iPad's opinion is a *witness*, used only when the laptop has
+    // none.
+    //
+    // This ordering has now been got wrong twice in opposite directions, so the
+    // reason is worth keeping: the iPad sits on a stand in front of the user, so
+    // its camera sees a face for most of the session. Trusting it first meant its
+    // opinion ("looking at the tablet") outranked the laptop's own, and every
+    // gesture made at the laptop was treated as aimed at the tablet: the cursor
+    // stopped following the hand for a third of a second at a time and a drag
+    // ended on its own. The tablet may only speak for the laptop when the laptop
+    // camera can see no face at all.
+    const local: 'laptop' | 'tablet' | null =
+      detailGaze === 'tablet' || detailGaze === 'laptop' ? detailGaze : null;
+    const decided: 'laptop' | 'tablet' =
+      local ??
+      (tabletGazeFresh()
+        ? tabletGaze.looking
+          ? 'tablet'
+          : 'laptop'
+        : lastPointer.gaze === 'tablet'
+          ? 'tablet'
+          : 'laptop');
     return decided === 'tablet' && !receiverConnected() ? 'laptop' : decided;
   };
 
@@ -988,6 +1006,16 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
         ? { ...(status as Record<string, unknown>), tabletGaze: { ...tabletGaze } }
         : status;
     emit(EV.gestureStatus, withTablet);
+    // The left hand gets a picture of its own: it is the only gesture with no
+    // visible result until a screen has already moved, so "is it even seeing my
+    // hand?" is otherwise unanswerable in the moment.
+    if (status && typeof status === 'object') {
+      const reading = status as { leftFist?: unknown; deskProgress?: unknown };
+      gestureHud().leftHand(
+        reading.leftFist === true,
+        Number.isFinite(Number(reading.deskProgress)) ? Number(reading.deskProgress) : 0,
+      );
+    }
   });
   gestures.on('event', (event: unknown) => {
     const msg = event as {
@@ -1091,6 +1119,14 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
       // The tablet's own gaze is the witness, not `lastPointer.gaze`: once the
       // head turns to the iPad the laptop's webcam loses the face, so only the
       // iPad can still say where the user is looking (see `tabletGazeFresh`).
+      // A window is physically held: the left hand is almost certainly just
+      // resting, and switching desktops mid-drag teleports the window to another
+      // desktop and strands ORBIT there. A drag always wins over a slide.
+      if (windowDrag || grabHeld) {
+        log.debug('ipc', 'Ignored a desktop/panel slide while a window is held.');
+        return;
+      }
+
       // The service's own router is the fallback for an iPad that is not
       // reporting (camera off, or booting): `lastPointer.gaze` is recomputed from
       // the live frame every pointer update, so it means what it says here.
@@ -1099,11 +1135,19 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
         : lastPointer.gaze === 'tablet';
       if (onTablet) {
         log.info('ipc', 'Panel swipe.', { direction });
+        gestureHud().flash(
+          direction === 'left' ? 'PREVIOUS WINDOW' : 'NEXT WINDOW',
+          'left fist · sideways slide',
+        );
         emit(EV.cyclePanel, direction === 'left' ? 'left' : 'right');
         return;
       }
 
       log.info('ipc', 'Desktop switch.', { direction });
+      gestureHud().flash(
+        direction === 'left' ? 'DESKTOP LEFT' : 'DESKTOP RIGHT',
+        'left fist · sideways slide',
+      );
       systemPointer.switchDesktop(direction === 'left' ? -1 : 1);
       // ORBIT is the screen the user is controlling from, so it must not ride
       // along to the desktop they just left. The swipe moves *everything*, ORBIT
@@ -1302,13 +1346,18 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     // pinned control to the iPad after the head had already come back: the iPad
     // had stopped reporting (stale), but the remembered value still said
     // 'tablet'. The freshly measured gaze is the better evidence every time.
+    // The service measures the user's head from the laptop camera on every
+    // frame, so when it has an opinion that opinion *is* where the user is
+    // looking. It is checked first for the same reason as `resolveGaze`: an iPad
+    // on a stand sees a face all session, and letting it outrank the laptop's own
+    // reading made the cursor freeze in bursts and broke window drags.
     const decidedFromService = frame.gaze === 'tablet' || frame.gaze === 'laptop';
-    const decided = tabletGazeFresh()
-      ? tabletGaze.looking
-        ? 'tablet'
-        : 'laptop'
-      : decidedFromService
-        ? frame.gaze
+    const decided = decidedFromService
+      ? (frame.gaze as 'laptop' | 'tablet')
+      : tabletGazeFresh()
+        ? tabletGaze.looking
+          ? 'tablet'
+          : 'laptop'
         : lastPointer.gaze === 'tablet'
           ? 'tablet'
           : 'laptop';
@@ -1316,16 +1365,22 @@ export function registerIpc({ client, settings, getWindow, desktopCapturer, gest
     // toward where the iPad would be. Otherwise movement stops at the worst
     // possible moment and the user reasonably reads it as "gestures are broken".
     const gaze = decided === 'tablet' && !receiverConnected() ? 'laptop' : decided;
-    // Hold the decision for a moment before it is allowed to take the window
+    // Hold the decision for a moment before it is allowed to take *a window*
     // away from the laptop. See `gazeOnTabletSince`.
+    //
+    // Only while a carry is in flight: the settle exists so a glance across the
+    // iPad cannot drop a window mid-drag. Applying it to the cursor as well made
+    // the pointer ignore the hand for a third of a second at a time, which is the
+    // "cursor movement is way worse now" report.
     let settled = true;
-    if (gaze === 'tablet') {
+    if (gaze === 'tablet' && grabHeld) {
       if (gazeOnTabletSince === 0) gazeOnTabletSince = Date.now();
       settled = Date.now() - gazeOnTabletSince >= GAZE_SETTLE_MS;
     } else {
       gazeOnTabletSince = 0;
     }
     lastPointer.gaze = settled ? gaze : 'laptop';
+    lastPointerAt = Date.now();
 
     if (settled && gaze === 'tablet') {
       // The hand follows the head: while the user looks at the iPad the OS

@@ -8,6 +8,86 @@ Newest entries first.
 
 ---
 
+## 2026-11-17 (forty-first pass) — the iPad was answering for the laptop
+
+**Scope:** `packages/desktop`, `packages/receiver`, `services/gestures`
+
+Reported, in one message: laptop cursor movement is "way worse", window dragging
+is "VERY glitchy", desktop switching "still doesn't work", and the left hand needs
+a visual indicator again. Only the iPad was supposed to change.
+
+### Both regressions had one cause
+
+The iPad's gaze opinion was being checked *before* the laptop's own. That ordering
+was introduced to make the transfer reliable, and it is wrong for everything else:
+the iPad sits on a stand in front of the user, so its camera sees a face for the
+whole session. Once it said "looking at the tablet", every pointer frame was
+routed to the tablet - `releaseOsPointer()` and `endWindowDrag()` ran on it, and
+the cursor stopped following the hand for as long as the state lasted. That is
+the cursor feeling worse and the drag breaking up, in one line of precedence.
+
+The laptop's own router measures the head from the laptop camera on every frame,
+so it now decides whenever it has an opinion. The iPad is a witness that speaks
+only when the laptop camera has no face at all - which is exactly the moment the
+transfer depends on. The same ordering was applied to `currentOwner()`, which had
+been silently dropping dictation.
+
+The gaze settle (`GAZE_SETTLE_MS`) also only applies while a window is carried
+now. It exists so a glance at the iPad cannot drop a window mid-drag; applying it
+to the cursor made the pointer ignore the hand for a third of a second at a time.
+
+### Desktop switching: the service saw the hand and threw the swipe away
+
+The new log line answered it in one gesture:
+
+```
+left hand closed
+left hand open            (108 ms later)
+```
+
+No `desktop.switch`, ever. The fist detector is not stable frame to frame, and
+the swipe anchor was cleared on the first open frame - so a 108 ms flicker reset
+the travel before it could add up to the one step (0.12) a switch needs. The
+gesture was being recognised and discarded on the same arm movement.
+
+An open hand now has a 260 ms grace before the swipe is considered released, and
+a hand that comes back *somewhere else* (more than 0.06 away) is treated as a new
+sweep rather than a flicker. Both cases are tested.
+
+Also: a left-fist slide is ignored entirely while a window is held. A resting left
+hand switching desktops mid-drag teleports the window to another desktop and
+strands ORBIT there - the "very glitchy" complaint would have looked exactly like
+that if it ever fired.
+
+### The indicator, and why it never appeared
+
+`gesture-hud.ts` is a new click-through, never-focused overlay at the bottom of the
+primary display: it says "LEFT HAND CLOSED" while the hand is closed, fills a bar
+as the slide progresses, and flashes "DESKTOP LEFT" / "NEXT WINDOW" when something
+actually happens. It shows the slide, not just the result, because the gesture is
+continuous.
+
+It was invisible for a plain reason: `normaliseStatus` in `gestures.ts` whitelists
+every field it forwards, and `leftFist` and `deskProgress` were not on the list.
+The service was sending them; the desktop was dropping them. Both are now passed
+through, along with their types, so the renderer can use them too.
+
+### Verified
+
+- gesture tests 282 passed, 0 failed (new: a flickering fist still completes its
+  sweep).
+- `npm run typecheck`, `npm run build` clean; ORBIT restarted on the new build.
+- Real log evidence for the diagnosis: `left hand closed` / `left hand open`, and
+  no `desktop.switch` line at all before this pass.
+- The overlay page's inline script parses (extracted from source and compiled).
+
+**Not verified:** the overlay on screen. `tools/hud-smoke.mjs` launches Electron
+to create it and report what it displays, but Electron here writes nothing to the
+console and the run timed out, so the page has been syntax-checked and not looked
+at. The desktop switch itself also needs a real left hand to confirm end to end.
+
+---
+
 ## 2026-11-16 (fortieth pass) — the window on the iPad is a window, not a picture of one
 
 **Scope:** `packages/shared`, `packages/server`, `packages/desktop`,

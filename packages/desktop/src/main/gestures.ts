@@ -46,6 +46,10 @@ export interface GestureStatus {
   handDetected: boolean;
   /** True only when the tracked hand is the right one. */
   rightHand: boolean;
+  /** The left hand is closed: it is mid-swipe between screens. */
+  leftFist: boolean;
+  /** How far that swipe has travelled, as a fraction of one step (-1..1). */
+  deskProgress: number;
   /** Mean brightness of the camera frame the landmarkers just saw (0-255). */
   cameraMean: number;
   /** True when the camera stream is delivering black frames, not an empty room. */
@@ -1122,6 +1126,11 @@ function normaliseStatus(msg: Record<string, unknown>): GestureStatus {
     handVisible: Boolean(msg.handVisible),
     handDetected: Boolean(msg.handDetected ?? msg.handVisible),
     rightHand: Boolean(msg.rightHand ?? msg.handVisible),
+    // The left hand: closed is a swipe, and `deskProgress` is how far that swipe
+    // has travelled. Both were being dropped here, which is why the left-hand
+    // overlay never appeared and the gesture looked like it did nothing.
+    leftFist: Boolean(msg.leftFist),
+    deskProgress: Number.isFinite(Number(msg.deskProgress)) ? Number(msg.deskProgress) : 0,
     // Older service builds omitted these; a frame is assumed healthy then, so a
     // stale build never shows a false "camera is black" warning.
     cameraMean: typeof msg.cameraMean === 'number' ? msg.cameraMean : -1,

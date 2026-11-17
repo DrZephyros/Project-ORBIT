@@ -167,6 +167,9 @@ class GestureService:
         self.throws = ThrowTracker()
         self._was_pinching = False
         self._was_scrolling = False
+        # Last reported state of the left hand, so its changes are logged once
+        # each instead of once per frame.
+        self._left_fist_last = False
         # When the scroll pose was last seen. Used to keep the scroll "sticky"
         # across a brief flicker without latching it on forever.
         self._scroll_seen_ms = 0
@@ -736,6 +739,17 @@ class GestureService:
                         left_fist = True
                         left_pointer = (left_anchor.x, left_anchor.y)
 
+            # One line per change, not per frame: the left hand is the only part
+            # of this gesture with no visual confirmation until a desktop has
+            # already moved, and "it does nothing" is otherwise unanswerable from
+            # the log.
+            if left_fist != self._left_fist_last:
+                self._left_fist_last = left_fist
+                print(
+                    f"[orbit-gestures] left hand {'closed' if left_fist else 'open'}",
+                    file=sys.stderr,
+                )
+
             events = self.machine.update(
                 now_ms,
                 at_mouth=fist.at_mouth,
@@ -769,6 +783,11 @@ class GestureService:
 
             for event in events:
                 self._annotate(event)
+                if event.kind == "desktop.switch":
+                    print(
+                        f"[orbit-gestures] desktop.switch {event.detail.get('direction')}",
+                        file=sys.stderr,
+                    )
                 if DEBUG:
                     print(f"[orbit-gestures] {event.kind}: {event.message}", file=sys.stderr)
                 await self.broadcast(self._event_payload(event))
@@ -823,6 +842,10 @@ class GestureService:
                         "handDetected": hand_detected,
                         "rightHand": hand_index is not None,
                         "leftFist": left_fist,
+                        # How far the left fist has slid toward the next screen,
+                        # so the UI can follow the hand instead of only reacting
+                        # at the moment it commits.
+                        "deskProgress": round(self.machine.desk_progress, 3),
                         "faceVisible": fist.face_visible,
                         "handLabel": hand_label,
                         "calibrated": self.calibration is not None,

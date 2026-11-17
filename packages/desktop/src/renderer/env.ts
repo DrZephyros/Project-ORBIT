@@ -91,6 +91,10 @@ export interface GestureStatus {
   handDetected: boolean;
   /** True only when the tracked hand is the right one. */
   rightHand: boolean;
+  /** The left hand is closed: it is mid-swipe between screens. */
+  leftFist: boolean;
+  /** How far that swipe has travelled, as a fraction of one step (-1..1). */
+  deskProgress: number;
   /** Mean brightness of the camera frame the landmarkers just saw (0-255). */
   cameraMean: number;
   /** True when the camera stream is black — not the same as an empty room. */

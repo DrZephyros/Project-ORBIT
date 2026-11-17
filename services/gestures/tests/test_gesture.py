@@ -1960,6 +1960,38 @@ def test_scroll_takes_more_travel_per_notch() -> None:
     check("a 20% sweep is two notches", notches == [-2], str(notches))
 
 
+def test_a_flickering_left_fist_still_completes_its_sweep() -> None:
+    """Reported: "the movement of desktops still doesn't work."
+
+    The service logged a left hand closed for 108 ms and then open. The fist
+    detector is not perfectly stable frame to frame, and the swipe anchor used to
+    be thrown away on the first open frame - so the travel was reset before it
+    could ever add up to a whole step, and no desktop ever moved.
+
+    One open frame in the middle of a sweep must not restart the sweep.
+    """
+    machine = MouthGestureMachine()
+    machine.arm(0)
+
+    events: list = []
+    # Closed, then a single flickered-open frame, then closed again in the same
+    # place and continuing the way the hand was already going.
+    positions = [0.30, 0.36, None, 0.42, 0.48, 0.54, 0.60]
+    for i, x in enumerate(positions):
+        events += feed(
+            machine,
+            i * 60,
+            left_fist=x is not None,
+            left_pointer=None if x is None else (x, 0.5),
+        )
+    switches = [e for e in events if e.kind == "desktop.switch"]
+    check(
+        "a fist that flickers open for one frame still switches",
+        len(switches) >= 1,
+        str([e.kind for e in events]),
+    )
+
+
 def test_a_held_left_fist_walks_desktops_as_it_moves() -> None:
     """Reported: "I shouldn't have to unclench my fist."
 

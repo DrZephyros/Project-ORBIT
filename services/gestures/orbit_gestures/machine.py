@@ -30,6 +30,10 @@ class Phase(str, Enum):
     COOLDOWN = "cooldown"
 
 
+# A re-formed left fist this far from the last one is a new sweep, not a flicker.
+DESK_REANCHOR_JUMP = 0.06
+
+
 @dataclass
 class GestureConfig:
     # How long a hand must be cupped near the mouth before dictation starts.
@@ -99,6 +103,11 @@ class GestureConfig:
     # only to stop a single physical movement being counted twice as landmarks
     # jitter across a step boundary.
     desktop_cooldown_ms: int = 120
+    # How long an *open* left hand must stay open before the swipe is considered
+    # released. A fist flickers - the service saw one for 108 ms and then not -
+    # and throwing the anchor away on the first open frame meant the travel never
+    # reached a whole step, so the desktop never moved.
+    desk_release_grace_ms: int = 260
 
 
 
@@ -181,6 +190,13 @@ class MouthGestureMachine:
         # (-1..1). Negative is left, positive right. Published so the UI can show
         # the slide in progress rather than a bare switch.
         self._desk_progress = 0.0
+        # When the left hand was last seen *open*. A fist is not perfectly stable
+        # frame to frame; see `desk_release_grace_ms`.
+        self._desk_open_since: int | None = None
+        # Where the left hand was on the previous frame, so a hand that flickered
+        # open and came back *somewhere else* can be told apart from one that
+        # never left.
+        self._desk_last_x: float | None = None
         # No "one switch per cup" state: the fist switches for as long as it keeps
         # moving, and the direction comes from the movement itself.
 
@@ -592,6 +608,16 @@ class MouthGestureMachine:
         self._scroll_accum = 0.0
 
     @property
+    def desk_progress(self) -> float:
+        """Travel toward the next desktop, as a fraction of one step (-1..1).
+
+        Positive is a slide to the right, negative to the left. Published so the
+        desktop can show the slide in the hand rather than only the moment it
+        commits - the gesture is continuous, and so is its feedback.
+        """
+        return self._desk_progress
+
+    @property
     def grab_active(self) -> bool:
         """True while a window is physically held, so the fist owns the frame."""
         return self._grab_phase is not None
@@ -627,13 +653,40 @@ class MouthGestureMachine:
         even though the shell's final move is instant.
         """
         if not left_fist:
-            # Released. Re-anchor, so the next fist is measured from where it is
-            # formed rather than from the last place the previous one ended.
+            # A closed hand is not perfectly stable frame to frame: the service
+            # logged a fist for 108 ms and then an open hand, and the anchor was
+            # thrown away in between. Since a swipe needs `desktop_step` of travel
+            # accumulated across frames, one flickering frame of "open" reset the
+            # count and the desktop never moved at all - the reported "moving
+            # between desktops still does not work".
+            #
+            # So an open hand only counts as a release once it has stayed open.
+            # During the grace the anchor is kept and the travel continues to
+            # accumulate, which is what the hand is actually doing.
+            if self._desk_open_since is None:
+                self._desk_open_since = now_ms
+            if now_ms - self._desk_open_since < self.config.desk_release_grace_ms:
+                return []
+            # Released for real. Re-anchor, so the next fist is measured from
+            # where it is formed rather than from where the last one ended.
+            self._desk_open_since = None
             self._desk_anchor_x = None
             self._desk_progress = 0.0
+            self._desk_last_x = None
             return []
 
         x = pointer[0]
+
+        # Re-closed after an open frame: if it came back somewhere else, that is
+        # a new fist and not the same sweep surviving a flicker. Measured before
+        # the grace is cleared, so the two cases stay distinguishable.
+        if self._desk_open_since is not None:
+            previous_x = self._desk_last_x
+            if previous_x is not None and abs(x - previous_x) > DESK_REANCHOR_JUMP:
+                self._desk_anchor_x = x
+                self._desk_progress = 0.0
+        self._desk_open_since = None
+        self._desk_last_x = x
 
         if self._desk_anchor_x is None:
             self._desk_anchor_x = x

@@ -8,6 +8,7 @@ import { GestureBridge } from './gestures.js';
 import { SystemPointer } from './system-pointer.js';
 import { initLogging, log, logFile, startFreezeWatchdog } from './log.js';
 import { carryIndicator } from './carry-indicator.js';
+import { gestureHud } from './gesture-hud.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -217,6 +218,7 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   log.info('app', 'Quitting.');
   carryIndicator().destroy();
+  gestureHud().destroy();
   client?.dispose();
   gestures?.stop();
   systemPointer?.dispose();
